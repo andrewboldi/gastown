@@ -77,6 +77,61 @@ func stopTownSessionInternal(t *tmux.Tmux, ts TownSession, force bool) (bool, er
 	return true, nil
 }
 
+// TownWindow represents a town-level agent as a window in the "hq" session.
+type TownWindow struct {
+	Name       string // Display name (e.g., "Mayor")
+	WindowName string // Tmux window name (e.g., "mayor")
+}
+
+// TownWindows returns the list of town-level windows in shutdown order.
+// Used in window-per-rig mode where all HQ agents share the "hq" session.
+func TownWindows() []TownWindow {
+	return []TownWindow{
+		{"Mayor", MayorWindowName()},
+		{"Boot", BootWindowName()},
+		{"Deacon", DeaconWindowName()},
+	}
+}
+
+// StopTownWindow stops a single town-level window in the hq session.
+func StopTownWindow(t *tmux.Tmux, tw TownWindow, force bool) (bool, error) {
+	has, err := t.HasWindow(HQSession, tw.WindowName)
+	if err != nil {
+		return false, err
+	}
+	if !has {
+		return false, nil
+	}
+
+	return stopTownWindowInternal(t, tw, force)
+}
+
+// stopTownWindowInternal performs the actual window stop.
+func stopTownWindowInternal(t *tmux.Tmux, tw TownWindow, force bool) (bool, error) {
+	target := HQSession + ":" + tw.WindowName
+
+	// Try graceful shutdown first (unless forced)
+	if !force {
+		_ = t.SendKeysRaw(target, "C-c")
+		WaitForWindowExit(t, HQSession, tw.WindowName, constants.GracefulShutdownTimeout)
+	}
+
+	// Log pre-death event
+	reason := "user shutdown"
+	if force {
+		reason = "forced shutdown"
+	}
+	_ = events.LogFeed(events.TypeSessionDeath, target,
+		events.SessionDeathPayload(target, tw.Name, reason, "gt down"))
+
+	// Kill the window (session stays alive for other agents)
+	if err := t.KillWindowWithProcesses(HQSession, tw.WindowName); err != nil {
+		return false, fmt.Errorf("killing %s window: %w", tw.Name, err)
+	}
+
+	return true, nil
+}
+
 // WaitForSessionExit polls for a session's process to exit within the given timeout.
 // Returns true if the process exited on its own, false if the timeout was reached.
 // This allows graceful shutdown (e.g., after Ctrl-C) to actually complete before

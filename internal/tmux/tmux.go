@@ -42,6 +42,7 @@ var (
 	ErrNoServer            = errors.New("no tmux server running")
 	ErrSessionExists       = errors.New("session already exists")
 	ErrSessionNotFound     = errors.New("session not found")
+	ErrWindowNotFound      = errors.New("window not found")
 	ErrInvalidSessionName  = errors.New("invalid session name")
 	ErrIdleTimeout         = errors.New("agent not idle before timeout")
 )
@@ -100,6 +101,10 @@ func (t *Tmux) wrapError(err error, stderr string, args []string) error {
 	if strings.Contains(stderr, "session not found") ||
 		strings.Contains(stderr, "can't find session") {
 		return ErrSessionNotFound
+	}
+	if strings.Contains(stderr, "window not found") ||
+		strings.Contains(stderr, "can't find window") {
+		return ErrWindowNotFound
 	}
 
 	if stderr != "" {
@@ -2400,5 +2405,159 @@ func (t *Tmux) SetAutoRespawnHook(session string) error {
 	}
 
 	return nil
+}
+
+// --- Window-per-rig primitives ---
+// These methods support the session-per-rig model where each rig has one tmux
+// session and each agent is a named window within that session.
+
+// EnsureSession creates a detached session if it doesn't already exist.
+// Returns (true, nil) if a new session was created, (false, nil) if it already
+// existed. This is atomic — avoids TOCTOU races between check and create.
+func (t *Tmux) EnsureSession(name, workDir string) (bool, error) {
+	if err := validateSessionName(name); err != nil {
+		return false, err
+	}
+	err := t.NewSession(name, workDir)
+	if err == nil {
+		return true, nil
+	}
+	if err == ErrSessionExists {
+		return false, nil
+	}
+	return false, err
+}
+
+// NewWindowWithCommand creates a new window in an existing session and runs a command.
+// The window is created detached (-d) so it doesn't auto-switch focus.
+func (t *Tmux) NewWindowWithCommand(session, windowName, workDir, command string) error {
+	args := []string{"new-window", "-d", "-t", session, "-n", windowName}
+	if workDir != "" {
+		args = append(args, "-c", workDir)
+	}
+	if command != "" {
+		args = append(args, command)
+	}
+	_, err := t.run(args...)
+	return err
+}
+
+// HasWindow checks if a named window exists in a session.
+// Uses exact-match session targeting ("=session") and scans window names.
+func (t *Tmux) HasWindow(session, windowName string) (bool, error) {
+	out, err := t.run("list-windows", "-t", "="+session, "-F", "#{window_name}")
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == windowName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListWindowNames returns all window names in a session.
+func (t *Tmux) ListWindowNames(session string) ([]string, error) {
+	out, err := t.run("list-windows", "-t", "="+session, "-F", "#{window_name}")
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
+// KillWindow kills a specific window in a session.
+func (t *Tmux) KillWindow(session, windowName string) error {
+	_, err := t.run("kill-window", "-t", session+":"+windowName)
+	return err
+}
+
+// KillWindowWithProcesses kills all processes in a window before destroying it.
+// Same process-tree cleanup strategy as KillSessionWithProcesses but scoped to
+// a single window. The session is left intact (other windows survive).
+func (t *Tmux) KillWindowWithProcesses(session, windowName string) error {
+	target := session + ":" + windowName
+
+	// Get the pane PID — target pane 0 of this window
+	pid, err := t.run("display-message", "-t", target+".0", "-p", "#{pane_pid}")
+	if err != nil {
+		// Window might not exist — try to kill it anyway
+		killErr := t.KillWindow(session, windowName)
+		if killErr == nil || errors.Is(killErr, ErrWindowNotFound) || errors.Is(killErr, ErrSessionNotFound) || errors.Is(killErr, ErrNoServer) {
+			return nil
+		}
+		return killErr
+	}
+	pid = strings.TrimSpace(pid)
+
+	if pid != "" {
+		// Walk the process tree for all descendants
+		descendants := getAllDescendants(pid)
+
+		// Build known PID set for group membership verification
+		knownPIDs := make(map[string]bool, len(descendants)+1)
+		knownPIDs[pid] = true
+		for _, d := range descendants {
+			knownPIDs[d] = true
+		}
+
+		// Find reparented processes from our process group
+		pgid := getProcessGroupID(pid)
+		if pgid != "" && pgid != "0" && pgid != "1" {
+			reparented := collectReparentedGroupMembers(pgid, knownPIDs)
+			descendants = append(descendants, reparented...)
+		}
+
+		// Send SIGTERM to all descendants (deepest first)
+		for _, dpid := range descendants {
+			_ = exec.Command("kill", "-TERM", dpid).Run()
+		}
+
+		// Wait for graceful shutdown
+		time.Sleep(processKillGracePeriod)
+
+		// Send SIGKILL to any remaining descendants
+		for _, dpid := range descendants {
+			_ = exec.Command("kill", "-KILL", dpid).Run()
+		}
+
+		// Kill the pane process itself
+		_ = exec.Command("kill", "-TERM", pid).Run()
+		time.Sleep(processKillGracePeriod)
+		_ = exec.Command("kill", "-KILL", pid).Run()
+	}
+
+	// Kill the tmux window
+	err = t.KillWindow(session, windowName)
+	if errors.Is(err, ErrWindowNotFound) || errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+		return nil
+	}
+	return err
+}
+
+// SetWindowOption sets a user-defined window option (@-prefixed).
+// target should be "session:window" format.
+func (t *Tmux) SetWindowOption(target, key, value string) error {
+	_, err := t.run("set-option", "-w", "-t", target, "@"+key, value)
+	return err
+}
+
+// GetWindowOption reads a user-defined window option (@-prefixed).
+// target should be "session:window" format.
+func (t *Tmux) GetWindowOption(target, key string) (string, error) {
+	out, err := t.run("show-option", "-wv", "-t", target, "@"+key)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }
 

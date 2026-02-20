@@ -33,7 +33,14 @@ import (
 //	})
 type SessionConfig struct {
 	// SessionID is the tmux session name (e.g., "gt-wyvern-Toast", "hq-mayor").
+	// In window-per-rig mode, this is the rig session (e.g., "gt", "hq").
 	SessionID string
+
+	// WindowName, when non-empty, enables window-per-rig mode.
+	// The agent is created as a named window within SessionID instead of
+	// as a separate tmux session. E.g., WindowName="witness" creates
+	// window "witness" in session "gt".
+	WindowName string
 
 	// WorkDir is the working directory for the session.
 	WorkDir string
@@ -110,6 +117,20 @@ type SessionConfig struct {
 	VerifySurvived bool
 }
 
+// tmuxTarget returns the tmux target string for this config.
+// In window-per-rig mode: "session:window". Otherwise: "session".
+func (c *SessionConfig) tmuxTarget() string {
+	if c.WindowName != "" {
+		return c.SessionID + ":" + c.WindowName
+	}
+	return c.SessionID
+}
+
+// isWindowMode returns true if this config uses window-per-rig mode.
+func (c *SessionConfig) isWindowMode() bool {
+	return c.WindowName != ""
+}
+
 // StartResult contains the results of session startup.
 type StartResult struct {
 	// RuntimeConfig is the resolved runtime config for the role.
@@ -180,14 +201,26 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		command = config.PrependEnv(command, cfg.ExtraEnv)
 	}
 
-	// 4. Create tmux session with command.
-	if err := t.NewSessionWithCommand(cfg.SessionID, cfg.WorkDir, command); err != nil {
-		return nil, fmt.Errorf("creating session: %w", err)
+	// 4. Create tmux session/window with command.
+	target := cfg.tmuxTarget()
+	if cfg.isWindowMode() {
+		// Window-per-rig mode: ensure rig session exists, create agent as window.
+		if _, err := t.EnsureSession(cfg.SessionID, cfg.WorkDir); err != nil {
+			return nil, fmt.Errorf("ensuring rig session %s: %w", cfg.SessionID, err)
+		}
+		if err := t.NewWindowWithCommand(cfg.SessionID, cfg.WindowName, cfg.WorkDir, command); err != nil {
+			return nil, fmt.Errorf("creating window %s in %s: %w", cfg.WindowName, cfg.SessionID, err)
+		}
+	} else {
+		// Legacy mode: one session per agent.
+		if err := t.NewSessionWithCommand(cfg.SessionID, cfg.WorkDir, command); err != nil {
+			return nil, fmt.Errorf("creating session: %w", err)
+		}
 	}
 
 	// 5. Set remain-on-exit immediately if requested (before anything else can fail).
 	if cfg.RemainOnExit {
-		_ = t.SetRemainOnExit(cfg.SessionID, true)
+		_ = t.SetRemainOnExit(target, true)
 	}
 
 	// 6. Set environment variables.
@@ -200,11 +233,27 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		Agent:            cfg.AgentOverride,
 	})
 	envVars = mergeRuntimeLivenessEnv(envVars, runtimeConfig)
-	for _, k := range mapKeysSorted(envVars) {
-		_ = t.SetEnvironment(cfg.SessionID, k, envVars[k])
-	}
-	for _, k := range mapKeysSorted(cfg.ExtraEnv) {
-		_ = t.SetEnvironment(cfg.SessionID, k, cfg.ExtraEnv[k])
+	if cfg.isWindowMode() {
+		// Window mode: store agent metadata as window options for per-window queries.
+		// Shared vars (GT_ROOT, GIT_CEILING_DIRECTORIES) go to session env.
+		for _, k := range mapKeysSorted(envVars) {
+			_ = t.SetWindowOption(target, k, envVars[k])
+		}
+		for _, k := range mapKeysSorted(cfg.ExtraEnv) {
+			_ = t.SetWindowOption(target, k, cfg.ExtraEnv[k])
+		}
+		// Also set shared env vars at session level (once, idempotent).
+		if cfg.TownRoot != "" {
+			_ = t.SetEnvironment(cfg.SessionID, "GT_ROOT", cfg.TownRoot)
+		}
+	} else {
+		// Legacy mode: all env vars as session environment.
+		for _, k := range mapKeysSorted(envVars) {
+			_ = t.SetEnvironment(cfg.SessionID, k, envVars[k])
+		}
+		for _, k := range mapKeysSorted(cfg.ExtraEnv) {
+			_ = t.SetEnvironment(cfg.SessionID, k, cfg.ExtraEnv[k])
+		}
 	}
 
 	// 7. Apply theme.
@@ -214,9 +263,13 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 8. Wait for agent to start.
 	if cfg.WaitForAgent {
-		if err := t.WaitForCommand(cfg.SessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+		if err := t.WaitForCommand(target, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 			if cfg.WaitFatal {
-				_ = t.KillSessionWithProcesses(cfg.SessionID)
+				if cfg.isWindowMode() {
+					_ = t.KillWindowWithProcesses(cfg.SessionID, cfg.WindowName)
+				} else {
+					_ = t.KillSessionWithProcesses(cfg.SessionID)
+				}
 				return nil, fmt.Errorf("waiting for %s to start: %w", cfg.Role, err)
 			}
 		}
@@ -224,39 +277,53 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 9. Auto-respawn hook.
 	if cfg.AutoRespawn {
-		if err := t.SetAutoRespawnHook(cfg.SessionID); err != nil {
+		if err := t.SetAutoRespawnHook(target); err != nil {
 			fmt.Printf("warning: failed to set auto-respawn hook for %s: %v\n", cfg.Role, err)
 		}
 	}
 
 	// 10. Accept bypass permissions warning.
 	if cfg.AcceptBypass {
-		_ = t.AcceptBypassPermissionsWarning(cfg.SessionID)
+		_ = t.AcceptBypassPermissionsWarning(target)
 	}
 
 	// 11. Ready delay: wait for agent to be fully ready at the prompt.
 	// Uses prompt-based polling for agents with ReadyPromptPrefix,
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
 	if cfg.ReadyDelay {
-		if err := t.WaitForRuntimeReady(cfg.SessionID, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
+		if err := t.WaitForRuntimeReady(target, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: agent readiness detection timed out for %s: %v\n", cfg.SessionID, err)
 		}
 	}
 
-	// 12. Verify session survived startup.
+	// 12. Verify session/window survived startup.
 	if cfg.VerifySurvived {
-		running, err := t.HasSession(cfg.SessionID)
-		if err != nil {
-			// Clean up session on verification error to prevent orphan
-			_ = t.KillSessionWithProcesses(cfg.SessionID)
-			return nil, fmt.Errorf("verifying session: %w", err)
-		}
-		if !running {
-			return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
+		if cfg.isWindowMode() {
+			alive, err := t.HasWindow(cfg.SessionID, cfg.WindowName)
+			if err != nil {
+				_ = t.KillWindowWithProcesses(cfg.SessionID, cfg.WindowName)
+				return nil, fmt.Errorf("verifying window: %w", err)
+			}
+			if !alive {
+				return nil, fmt.Errorf("window %s:%s died during startup", cfg.SessionID, cfg.WindowName)
+			}
+		} else {
+			running, err := t.HasSession(cfg.SessionID)
+			if err != nil {
+				_ = t.KillSessionWithProcesses(cfg.SessionID)
+				return nil, fmt.Errorf("verifying session: %w", err)
+			}
+			if !running {
+				return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
+			}
 		}
 	}
 
-	// 13. Track PID for defense-in-depth orphan cleanup.
+	// 13. Startup fallback for runtimes without executable hooks.
+	// Non-fatal by design: session startup should not fail if nudge injection fails.
+	_ = runtime.RunStartupFallbackWithDelay(t, target, cfg.Role, runtimeConfig)
+
+	// 14. Track PID for defense-in-depth orphan cleanup.
 	if cfg.TrackPID && cfg.TownRoot != "" {
 		_ = TrackSessionPID(cfg.TownRoot, cfg.SessionID, t)
 	}
@@ -289,6 +356,43 @@ func StopSession(t *tmux.Tmux, sessionID string, graceful bool) error {
 	return nil
 }
 
+// StopWindow stops a tmux window with optional graceful shutdown.
+// Like StopSession but scoped to a single window within a session.
+func StopWindow(t *tmux.Tmux, session, window string, graceful bool) error {
+	has, err := t.HasWindow(session, window)
+	if err != nil {
+		return fmt.Errorf("checking window: %w", err)
+	}
+	if !has {
+		return fmt.Errorf("window not found: %s:%s", session, window)
+	}
+
+	target := session + ":" + window
+	if graceful {
+		_ = t.SendKeysRaw(target, "C-c")
+		WaitForWindowExit(t, session, window, constants.GracefulShutdownTimeout)
+	}
+
+	if err := t.KillWindowWithProcesses(session, window); err != nil {
+		return fmt.Errorf("killing window: %w", err)
+	}
+
+	return nil
+}
+
+// WaitForWindowExit polls for a window to disappear within the given timeout.
+func WaitForWindowExit(t *tmux.Tmux, session, window string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		has, err := t.HasWindow(session, window)
+		if err != nil || !has {
+			return true
+		}
+		time.Sleep(constants.PollInterval)
+	}
+	return false
+}
+
 func mapKeysSorted(m map[string]string) []string {
 	if len(m) == 0 {
 		return nil
@@ -302,8 +406,8 @@ func mapKeysSorted(m map[string]string) []string {
 }
 
 // mergeRuntimeLivenessEnv ensures liveness-critical env vars are present in the
-// tmux session environment table, even when agent resolution came from
-// workspace/default settings rather than an explicit --agent override.
+// tmux environment table, even when agent resolution came from workspace/default
+// settings rather than an explicit --agent override.
 func mergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.RuntimeConfig) map[string]string {
 	if envVars == nil {
 		envVars = make(map[string]string)
@@ -359,6 +463,24 @@ func KillExistingSession(t *tmux.Tmux, sessionID string, checkAlive bool) (bool,
 
 	if err := t.KillSessionWithProcesses(sessionID); err != nil {
 		return false, fmt.Errorf("killing session %s: %w", sessionID, err)
+	}
+
+	return true, nil
+}
+
+// KillExistingWindow kills an existing window if one is found.
+// Returns true if a window was killed. The session is left intact.
+func KillExistingWindow(t *tmux.Tmux, session, window string) (bool, error) {
+	has, err := t.HasWindow(session, window)
+	if err != nil {
+		return false, fmt.Errorf("checking window: %w", err)
+	}
+	if !has {
+		return false, nil
+	}
+
+	if err := t.KillWindowWithProcesses(session, window); err != nil {
+		return false, fmt.Errorf("killing window %s:%s: %w", session, window, err)
 	}
 
 	return true, nil

@@ -59,3 +59,84 @@ func OverseerSessionName() string {
 func BootSessionName() string {
 	return HQPrefix + "boot"
 }
+
+// --- Window-per-rig naming ---
+// In the window-per-rig model, each rig has one tmux session (e.g., "gt")
+// and each agent is a named window within it (e.g., "witness", "crew-max").
+
+// HQSession is the session name for town-level agents.
+const HQSession = "hq"
+
+// RigSessionName returns the session name for a rig.
+// In the window-per-rig model this is just the rig prefix (e.g., "gt", "bd").
+func RigSessionName(rigPrefix string) string {
+	return rigPrefix
+}
+
+// HQSessionName returns the session name for town-level agents.
+func HQSessionName() string {
+	return HQSession
+}
+
+// MayorWindowName returns the window name for the Mayor agent.
+func MayorWindowName() string { return "mayor" }
+
+// DeaconWindowName returns the window name for the Deacon agent.
+func DeaconWindowName() string { return "deacon" }
+
+// BootWindowName returns the window name for the Boot watchdog.
+func BootWindowName() string { return "boot" }
+
+// OverseerWindowName returns the window name for the human operator.
+func OverseerWindowName() string { return "overseer" }
+
+// WitnessWindowName returns the window name for a rig's Witness agent.
+func WitnessWindowName() string { return "witness" }
+
+// RefineryWindowName returns the window name for a rig's Refinery agent.
+func RefineryWindowName() string { return "refinery" }
+
+// CrewWindowName returns the window name for a crew worker.
+func CrewWindowName(name string) string {
+	return "crew-" + name
+}
+
+// PolecatWindowName returns the window name for a polecat.
+func PolecatWindowName(name string) string {
+	return name
+}
+
+// MayorTarget returns the tmux target for the Mayor agent.
+func MayorTarget() TmuxTarget {
+	return NewTarget(HQSession, MayorWindowName())
+}
+
+// DeaconTarget returns the tmux target for the Deacon agent.
+func DeaconTarget() TmuxTarget {
+	return NewTarget(HQSession, DeaconWindowName())
+}
+
+// BootTarget returns the tmux target for the Boot watchdog.
+func BootTarget() TmuxTarget {
+	return NewTarget(HQSession, BootWindowName())
+}
+
+// WitnessTarget returns the tmux target for a rig's Witness agent.
+func WitnessTarget(rigPrefix string) TmuxTarget {
+	return NewTarget(RigSessionName(rigPrefix), WitnessWindowName())
+}
+
+// RefineryTarget returns the tmux target for a rig's Refinery agent.
+func RefineryTarget(rigPrefix string) TmuxTarget {
+	return NewTarget(RigSessionName(rigPrefix), RefineryWindowName())
+}
+
+// CrewTarget returns the tmux target for a crew worker in a rig.
+func CrewTarget(rigPrefix, name string) TmuxTarget {
+	return NewTarget(RigSessionName(rigPrefix), CrewWindowName(name))
+}
+
+// PolecatTarget returns the tmux target for a polecat in a rig.
+func PolecatTarget(rigPrefix, name string) TmuxTarget {
+	return NewTarget(RigSessionName(rigPrefix), PolecatWindowName(name))
+}

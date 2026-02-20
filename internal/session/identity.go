@@ -260,3 +260,108 @@ func (a *AgentIdentity) Address() string {
 func (a *AgentIdentity) GTRole() string {
 	return a.Address()
 }
+
+// Target returns the tmux target in "session:window" format for the window-per-rig model.
+func (a *AgentIdentity) Target() TmuxTarget {
+	return NewTarget(a.RigSession(), a.WindowName())
+}
+
+// RigSession returns the tmux session name for this agent's rig.
+// Town-level agents use "hq"; rig-level agents use their prefix (e.g., "gt").
+func (a *AgentIdentity) RigSession() string {
+	switch a.Role {
+	case RoleMayor, RoleDeacon, RoleOverseer:
+		return HQSession
+	default:
+		return RigSessionName(a.prefix())
+	}
+}
+
+// WindowName returns the tmux window name for this agent.
+func (a *AgentIdentity) WindowName() string {
+	switch a.Role {
+	case RoleMayor:
+		return MayorWindowName()
+	case RoleDeacon:
+		if a.Name == "boot" {
+			return BootWindowName()
+		}
+		return DeaconWindowName()
+	case RoleOverseer:
+		return OverseerWindowName()
+	case RoleWitness:
+		return WitnessWindowName()
+	case RoleRefinery:
+		return RefineryWindowName()
+	case RoleCrew:
+		return CrewWindowName(a.Name)
+	case RolePolecat:
+		return PolecatWindowName(a.Name)
+	default:
+		return ""
+	}
+}
+
+// ParseTarget parses a TmuxTarget ("session:window") into an AgentIdentity.
+// Uses the default PrefixRegistry to resolve rig prefixes.
+//
+// Target formats:
+//   - hq:mayor → Role: mayor
+//   - hq:deacon → Role: deacon
+//   - hq:boot → Role: deacon, Name: boot
+//   - gt:witness → Role: witness (rig resolved from "gt")
+//   - gt:refinery → Role: refinery
+//   - gt:crew-max → Role: crew, Name: max
+//   - gt:Toast → Role: polecat, Name: Toast
+func ParseTarget(target TmuxTarget) (*AgentIdentity, error) {
+	return ParseTargetWithRegistry(target, defaultRegistry)
+}
+
+// ParseTargetWithRegistry parses a TmuxTarget using a specific registry.
+func ParseTargetWithRegistry(target TmuxTarget, registry *PrefixRegistry) (*AgentIdentity, error) {
+	if registry == nil {
+		registry = NewPrefixRegistry()
+	}
+
+	session := target.Session()
+	window := target.Window()
+	if session == "" || window == "" {
+		return nil, fmt.Errorf("invalid target %q: must be session:window", target)
+	}
+
+	// Town-level agents
+	if session == HQSession {
+		switch window {
+		case "mayor":
+			return &AgentIdentity{Role: RoleMayor}, nil
+		case "deacon":
+			return &AgentIdentity{Role: RoleDeacon}, nil
+		case "boot":
+			return &AgentIdentity{Role: RoleDeacon, Name: "boot"}, nil
+		case "overseer":
+			return &AgentIdentity{Role: RoleOverseer}, nil
+		default:
+			return nil, fmt.Errorf("invalid target %q: unknown hq window", target)
+		}
+	}
+
+	// Rig-level agents — session is the prefix (e.g., "gt")
+	prefix := session
+	rig := registry.RigForPrefix(prefix)
+
+	switch {
+	case window == "witness":
+		return &AgentIdentity{Role: RoleWitness, Rig: rig, Prefix: prefix}, nil
+	case window == "refinery":
+		return &AgentIdentity{Role: RoleRefinery, Rig: rig, Prefix: prefix}, nil
+	case strings.HasPrefix(window, "crew-"):
+		name := window[5:] // len("crew-") == 5
+		if name == "" {
+			return nil, fmt.Errorf("invalid target %q: empty crew name", target)
+		}
+		return &AgentIdentity{Role: RoleCrew, Rig: rig, Name: name, Prefix: prefix}, nil
+	default:
+		// Default: polecat
+		return &AgentIdentity{Role: RolePolecat, Rig: rig, Name: window, Prefix: prefix}, nil
+	}
+}
