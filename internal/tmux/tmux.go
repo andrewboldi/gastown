@@ -39,12 +39,12 @@ var validSessionNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // Common errors
 var (
-	ErrNoServer            = errors.New("no tmux server running")
-	ErrSessionExists       = errors.New("session already exists")
-	ErrSessionNotFound     = errors.New("session not found")
-	ErrWindowNotFound      = errors.New("window not found")
-	ErrInvalidSessionName  = errors.New("invalid session name")
-	ErrIdleTimeout         = errors.New("agent not idle before timeout")
+	ErrNoServer           = errors.New("no tmux server running")
+	ErrSessionExists      = errors.New("session already exists")
+	ErrSessionNotFound    = errors.New("session not found")
+	ErrWindowNotFound     = errors.New("window not found")
+	ErrInvalidSessionName = errors.New("invalid session name")
+	ErrIdleTimeout        = errors.New("agent not idle before timeout")
 )
 
 // validateSessionName checks that a session name contains only safe characters.
@@ -1792,6 +1792,22 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 // Claude Code uses ❯ (U+276F) as the prompt character.
 const DefaultReadyPromptPrefix = "❯ "
 
+// SessionSupportsHooks reports whether the session's configured agent supports hooks.
+// Returns true on lookup failures so callers can safely assume hook support by default.
+func (t *Tmux) SessionSupportsHooks(session string) bool {
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentName == "" {
+		return true
+	}
+
+	preset := config.GetAgentPresetByName(agentName)
+	if preset == nil {
+		return true
+	}
+
+	return preset.SupportsHooks
+}
+
 // WaitForIdle polls until the agent appears to be at an idle prompt.
 // Unlike WaitForRuntimeReady (which is for bootstrap), this is for steady-state
 // idle detection — used to avoid interrupting agents mid-work.
@@ -1800,6 +1816,11 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := DefaultReadyPromptPrefix
+	if agentName, err := t.GetEnvironment(session, "GT_AGENT"); err == nil && agentName != "" {
+		if preset := config.GetAgentPresetByName(agentName); preset != nil && preset.ReadyPromptPrefix != "" {
+			promptPrefix = preset.ReadyPromptPrefix
+		}
+	}
 	prefix := strings.TrimSpace(promptPrefix)
 
 	deadline := time.Now().Add(timeout)

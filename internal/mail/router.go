@@ -1418,6 +1418,22 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			continue
 		}
 
+		// Non-hook agents cannot drain queued nudges, so deliver immediately.
+		if !r.tmux.SessionSupportsHooks(sessionID) {
+			err := r.tmux.NudgeSession(sessionID, notification)
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, tmux.ErrSessionNotFound) {
+				// Session disappeared before direct fallback nudge — try next candidate
+				continue
+			}
+			if errors.Is(err, tmux.ErrNoServer) {
+				return nil
+			}
+			return err
+		}
+
 		// Busy or nudge failed → enqueue for cooperative delivery at the
 		// agent's next turn boundary.
 		if r.townRoot != "" {

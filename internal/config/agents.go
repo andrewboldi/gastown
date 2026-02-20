@@ -211,7 +211,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		Command:             "codex",
 		Args:                []string{"--dangerously-bypass-approvals-and-sandbox"},
 		ProcessNames:        []string{"codex"}, // Codex CLI binary
-		SessionIDEnv:        "",                 // Codex captures from JSONL output
+		SessionIDEnv:        "",                // Codex captures from JSONL output
 		ResumeFlag:          "resume",
 		ResumeStyle:         "subcommand",
 		SupportsHooks:       false, // Use env/files instead
@@ -221,9 +221,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			OutputFlag: "--json",
 		},
 		// Runtime defaults
-		PromptMode:       "none",
-		ReadyDelayMs:     3000,
-		InstructionsFile: "AGENTS.md",
+		PromptMode:        "none",
+		ReadyDelayMs:      3000,
+		ReadyPromptPrefix: "> ",
+		InstructionsFile:  "AGENTS.md",
 	},
 	AgentCursor: {
 		Name:                AgentCursor,
@@ -280,8 +281,8 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			"OPENCODE_PERMISSION": `{"*":"allow"}`,
 		},
 		ProcessNames:        []string{"opencode", "node", "bun"}, // Runs as Node.js or Bun
-		SessionIDEnv:        "",                                   // OpenCode manages sessions internally
-		ResumeFlag:          "",                                   // No resume support yet
+		SessionIDEnv:        "",                                  // OpenCode manages sessions internally
+		ResumeFlag:          "",                                  // No resume support yet
 		ResumeStyle:         "",
 		SupportsHooks:       true, // Uses .opencode/plugins/gastown.js
 		SupportsForkSession: false,
@@ -303,7 +304,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		Command:             "copilot",
 		Args:                []string{"--yolo"},
 		ProcessNames:        []string{"copilot"}, // Copilot CLI binary (Node.js but reports as "copilot")
-		SessionIDEnv:        "",                   // Session IDs stored on disk, not in env
+		SessionIDEnv:        "",                  // Session IDs stored on disk, not in env
 		ResumeFlag:          "--resume",
 		ResumeStyle:         "flag",
 		SupportsHooks:       false, // Copilot instructions file is not executable hooks
@@ -325,12 +326,12 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 	AgentPi: {
 		Name:                AgentPi,
 		Command:             "pi",
-		Args:                []string{}, // Extension loaded via -e flag in town settings
+		Args:                []string{},                    // Extension loaded via -e flag in town settings
 		ProcessNames:        []string{"pi", "node", "bun"}, // Pi runs as Node.js
 		SessionIDEnv:        "PI_SESSION_ID",
-		ResumeFlag:          "",    // No resume support yet
+		ResumeFlag:          "", // No resume support yet
 		ResumeStyle:         "",
-		SupportsHooks:       true,  // Uses .pi/extensions/gastown-hooks.js
+		SupportsHooks:       true, // Uses .pi/extensions/gastown-hooks.js
 		HooksProvider:       "pi",
 		HooksDir:            ".pi/extensions",
 		HooksSettingsFile:   "gastown-hooks.js",
@@ -495,9 +496,9 @@ func RuntimeConfigFromPreset(preset AgentPreset) *RuntimeConfig {
 
 	rc := &RuntimeConfig{
 		Provider: string(info.Name),
-		Command: info.Command,
-		Args:    append([]string(nil), info.Args...), // Copy to avoid mutation
-		Env:     envCopy,
+		Command:  info.Command,
+		Args:     append([]string(nil), info.Args...), // Copy to avoid mutation
+		Env:      envCopy,
 	}
 
 	// Resolve command path for claude preset (handles alias installations)

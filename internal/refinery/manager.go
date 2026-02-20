@@ -17,8 +17,8 @@ import (
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
-	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -51,48 +51,76 @@ func (m *Manager) SetOutput(w io.Writer) {
 	m.output = w
 }
 
-// SessionName returns the tmux session name for this refinery.
+// SessionName returns the legacy tmux session name for this refinery.
+// Deprecated: Use Target() for window-per-rig mode.
 func (m *Manager) SessionName() string {
 	return session.RefinerySessionName(session.PrefixFor(m.rig.Name))
 }
 
-// IsRunning checks if the refinery session is active and healthy.
-// Checks both tmux session existence AND agent process liveness to avoid
-// reporting zombie sessions (tmux alive but Claude dead) as "running".
-// ZFC: tmux session existence is the source of truth for session state,
-// but agent liveness determines if the session is actually functional.
-func (m *Manager) IsRunning() (bool, error) {
-	t := tmux.NewTmux()
-	sessionName := m.SessionName()
-	status := t.CheckSessionHealth(sessionName, 0)
-	return status == tmux.SessionHealthy, nil
+// rigSession returns the rig session name (e.g., "gt").
+func (m *Manager) rigSession() string {
+	return session.RigSessionName(session.PrefixFor(m.rig.Name))
 }
 
-// IsHealthy checks if the refinery is running and has been active recently.
-// Unlike IsRunning which only checks process liveness, this also detects hung
-// sessions where Claude is alive but hasn't produced output in maxInactivity.
-// Returns the detailed ZombieStatus for callers that need to distinguish
-// between different failure modes.
+// Target returns the tmux target for this refinery (e.g., "gt:refinery").
+func (m *Manager) Target() session.TmuxTarget {
+	return session.RefineryTarget(session.PrefixFor(m.rig.Name))
+}
+
+// IsRunning checks if the refinery window is active.
+// ZFC: tmux window existence is the source of truth.
+func (m *Manager) IsRunning() (bool, error) {
+	t := tmux.NewTmux()
+	rigSess := m.rigSession()
+	window := session.RefineryWindowName()
+	target := m.Target().String()
+
+	has, err := t.HasWindow(rigSess, window)
+	if err != nil || !has {
+		return false, err
+	}
+	return t.IsAgentAlive(target), nil
+}
+
+// IsHealthy checks if the refinery window is running and active recently.
 func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
 	t := tmux.NewTmux()
-	return t.CheckSessionHealth(m.SessionName(), maxInactivity)
+	rigSess := m.rigSession()
+	window := session.RefineryWindowName()
+	target := m.Target().String()
+
+	hasWindow, err := t.HasWindow(rigSess, window)
+	if err != nil || !hasWindow {
+		return tmux.SessionDead
+	}
+	if !t.IsAgentAlive(target) {
+		return tmux.AgentDead
+	}
+	if maxInactivity > 0 {
+		if lastActivity, err := t.GetSessionActivity(rigSess); err == nil && !lastActivity.IsZero() {
+			if time.Since(lastActivity) > maxInactivity {
+				return tmux.AgentHung
+			}
+		}
+	}
+	return tmux.SessionHealthy
 }
 
 // Status returns information about the refinery session.
-// ZFC-compliant: tmux session is the source of truth.
+// ZFC-compliant: tmux window existence is the source of truth.
 func (m *Manager) Status() (*tmux.SessionInfo, error) {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
+	rigSess := m.rigSession()
 
-	running, err := t.HasSession(sessionID)
+	running, err := t.HasWindow(rigSess, session.RefineryWindowName())
 	if err != nil {
-		return nil, fmt.Errorf("checking session: %w", err)
+		return nil, fmt.Errorf("checking window: %w", err)
 	}
 	if !running {
 		return nil, ErrNotRunning
 	}
 
-	return t.GetSessionInfo(sessionID)
+	return t.GetSessionInfo(rigSess)
 }
 
 // Start starts the refinery.
@@ -102,30 +130,32 @@ func (m *Manager) Status() (*tmux.SessionInfo, error) {
 // ZFC-compliant: no state file, tmux session is source of truth.
 func (m *Manager) Start(foreground bool, agentOverride string) error {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
+	rigSess := m.rigSession()
+	windowName := session.RefineryWindowName()
+	target := m.Target().String()
 
 	if foreground {
 		// Foreground mode is deprecated - the Refinery agent handles merge processing
 		return fmt.Errorf("foreground mode is deprecated; use background mode (remove --foreground flag)")
 	}
 
-	// Check if session already exists
-	running, _ := t.HasSession(sessionID)
+	// Check if window already exists
+	running, _ := t.HasWindow(rigSess, windowName)
 	if running {
-		// Session exists - check if agent is actually running (healthy vs zombie)
-		if t.IsAgentAlive(sessionID) {
+		// Window exists - check if agent is actually running (healthy vs zombie)
+		if t.IsAgentAlive(target) {
 			return ErrAlreadyRunning
 		}
 		// Zombie - tmux alive but agent dead. Kill and recreate.
-		_, _ = fmt.Fprintln(m.output, "⚠ Detected zombie session (tmux alive, agent dead). Recreating...")
-		if err := t.KillSession(sessionID); err != nil {
-			return fmt.Errorf("killing zombie session: %w", err)
+		_, _ = fmt.Fprintln(m.output, "⚠ Detected zombie window (tmux alive, agent dead). Recreating...")
+		if err := t.KillWindowWithProcesses(rigSess, windowName); err != nil {
+			return fmt.Errorf("killing zombie window: %w", err)
 		}
 	}
 
-	// Note: No PID check per ZFC - tmux session is the source of truth
+	// Note: No PID check per ZFC - tmux window is the source of truth
 
-	// Background mode: spawn a Claude agent in a tmux session
+	// Background mode: spawn a Claude agent as a window in the rig session
 	// The Claude agent handles MR processing using git commands and beads
 
 	// Working directory is the refinery worktree (shares .git with mayor/polecats)
@@ -162,19 +192,22 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		TownRoot:    townRoot,
 		Prompt:      initialPrompt,
 		Topic:       "patrol",
-		SessionName: sessionID,
+		SessionName: target,
 	}, m.rig.Path, initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := t.NewSessionWithCommand(sessionID, refineryRigDir, command); err != nil {
-		return fmt.Errorf("creating tmux session: %w", err)
+	// Create window in rig session. EnsureSession creates the rig session if needed.
+	created, err := t.EnsureSession(rigSess, refineryRigDir)
+	if err != nil {
+		return fmt.Errorf("ensuring rig session %s: %w", rigSess, err)
+	}
+	if err := t.NewWindowWithCommand(rigSess, windowName, refineryRigDir, command); err != nil {
+		return fmt.Errorf("creating refinery window: %w", err)
 	}
 
-	// Set environment variables (non-fatal: session works without these)
+	// Set agent metadata as window options (non-fatal)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:     "refinery",
@@ -186,46 +219,55 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Add refinery-specific flag
 	envVars["GT_REFINERY"] = "1"
 
-	// Set all env vars in tmux session (for debugging) and they'll also be exported to Claude
+	// Set all env vars as window options
 	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionID, k, v)
+		_ = t.SetWindowOption(target, k, v)
+	}
+	// Shared session-level env vars (set once, idempotent)
+	if townRoot != "" {
+		_ = t.SetEnvironment(rigSess, "GT_ROOT", townRoot)
 	}
 
-	// Apply theme (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.AssignTheme(m.rig.Name)
-	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "refinery", "refinery")
+	// Apply theme only when rig session first created (non-fatal)
+	if created {
+		theme := tmux.AssignTheme(m.rig.Name)
+		_ = t.ConfigureGasTownSession(rigSess, theme, m.rig.Name, "refinery", "refinery")
+	}
 
 	// Accept bypass permissions warning dialog if it appears.
 	// Must be before WaitForRuntimeReady to avoid race where dialog blocks prompt detection.
-	_ = t.AcceptBypassPermissionsWarning(sessionID)
+	_ = t.AcceptBypassPermissionsWarning(target)
 
 	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch
 	// WaitForRuntimeReady waits for the runtime to be ready
-	if err := t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
-		// Kill the zombie session before returning error
-		_ = t.KillSessionWithProcesses(sessionID)
+	if err := t.WaitForRuntimeReady(target, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
+		// Kill the zombie window before returning error
+		_ = t.KillWindowWithProcesses(rigSess, windowName)
 		return fmt.Errorf("waiting for refinery to start: %w", err)
 	}
 
-	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
+	// Wait for runtime to be fully ready
+	runtime.SleepForReadyDelay(runtimeConfig)
+	_ = runtime.RunStartupFallback(t, target, "refinery", runtimeConfig)
 
 	return nil
 }
 
 // Stop stops the refinery.
-// ZFC-compliant: tmux session is the source of truth.
+// ZFC-compliant: tmux window existence is the source of truth.
 func (m *Manager) Stop() error {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
+	rigSess := m.rigSession()
+	windowName := session.RefineryWindowName()
 
-	// Check if tmux session exists
-	running, _ := t.HasSession(sessionID)
+	// Check if tmux window exists
+	running, _ := t.HasWindow(rigSess, windowName)
 	if !running {
 		return ErrNotRunning
 	}
 
-	// Kill the tmux session
-	return t.KillSession(sessionID)
+	// Kill the tmux window
+	return t.KillWindowWithProcesses(rigSess, windowName)
 }
 
 // Queue returns the current merge queue.

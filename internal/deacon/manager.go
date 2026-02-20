@@ -34,6 +34,13 @@ type tmuxOps interface {
 	AcceptBypassPermissionsWarning(session string) error
 	SendKeysRaw(session, keys string) error
 	GetSessionInfo(name string) (*tmux.SessionInfo, error)
+
+	// Window-per-rig methods
+	HasWindow(session, windowName string) (bool, error)
+	KillWindowWithProcesses(session, windowName string) error
+	EnsureSession(name, workDir string) (bool, error)
+	NewWindowWithCommand(session, windowName, workDir, command string) error
+	SetWindowOption(target, key, value string) error
 }
 
 // Manager handles deacon lifecycle operations.
@@ -50,15 +57,20 @@ func NewManager(townRoot string) *Manager {
 	}
 }
 
-// SessionName returns the tmux session name for the deacon.
-// This is a package-level function for convenience.
+// SessionName returns the legacy tmux session name for the deacon.
+// Deprecated: Use Target() for window-per-rig mode.
 func SessionName() string {
 	return session.DeaconSessionName()
 }
 
-// SessionName returns the tmux session name for the deacon.
+// SessionName returns the legacy tmux session name for the deacon.
 func (m *Manager) SessionName() string {
 	return SessionName()
+}
+
+// Target returns the tmux target for the deacon (e.g., "hq:deacon").
+func (m *Manager) Target() session.TmuxTarget {
+	return session.DeaconTarget()
 }
 
 // deaconDir returns the working directory for the deacon.

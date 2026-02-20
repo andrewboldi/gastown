@@ -645,9 +645,20 @@ func (m *Manager) setupSharedBeads(crewPath string) error {
 	return beads.SetupRedirect(townRoot, crewPath)
 }
 
-// SessionName returns the tmux session name for a crew member.
+// SessionName returns the legacy tmux session name for a crew member.
+// Deprecated: Use Target() for window-per-rig mode.
 func (m *Manager) SessionName(name string) string {
 	return session.CrewSessionName(session.PrefixFor(m.rig.Name), name)
+}
+
+// rigSession returns the rig session name (e.g., "gt").
+func (m *Manager) rigSession() string {
+	return session.RigSessionName(session.PrefixFor(m.rig.Name))
+}
+
+// Target returns the tmux target for a crew member (e.g., "gt:crew-max").
+func (m *Manager) Target(name string) session.TmuxTarget {
+	return session.CrewTarget(session.PrefixFor(m.rig.Name), name)
 }
 
 // Start creates and starts a tmux session for a crew member.
@@ -763,30 +774,30 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	}
 
 	t := tmux.NewTmux()
-	sessionID := m.SessionName(name)
+	rigSess := m.rigSession()
+	windowName := session.CrewWindowName(name)
+	target := m.Target(name).String()
 
-	// Check if session already exists — kill AFTER command is fully built
-	// so validation failures don't destroy the user's running session.
-	running, err := t.HasSession(sessionID)
+	// Check if window already exists — kill AFTER command is fully built
+	// so validation failures don't destroy the user's running window.
+	existing, err := t.HasWindow(rigSess, windowName)
 	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
+		return fmt.Errorf("checking window: %w", err)
 	}
-	if running {
+	if existing {
 		if opts.KillExisting {
-			// Restart/resume mode - kill existing session.
-			// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-			if err := t.KillSessionWithProcesses(sessionID); err != nil {
-				return fmt.Errorf("killing existing session: %w", err)
+			// Restart/resume mode - kill existing window.
+			if err := t.KillWindowWithProcesses(rigSess, windowName); err != nil {
+				return fmt.Errorf("killing existing window: %w", err)
 			}
 		} else {
-			// Normal start - session exists, check if agent is actually running
-			if t.IsAgentAlive(sessionID) {
-				return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+			// Normal start - window exists, check if agent is actually running
+			if t.IsAgentAlive(target) {
+				return fmt.Errorf("%w: %s", ErrSessionRunning, target)
 			}
-			// Zombie session - kill and recreate.
-			// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-			if err := t.KillSessionWithProcesses(sessionID); err != nil {
-				return fmt.Errorf("killing zombie session: %w", err)
+			// Zombie window - kill and recreate.
+			if err := t.KillWindowWithProcesses(rigSess, windowName); err != nil {
+				return fmt.Errorf("killing zombie window: %w", err)
 			}
 		}
 	}
@@ -796,64 +807,77 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		claudeCmd = strings.Replace(claudeCmd, " --dangerously-skip-permissions", "", 1)
 	}
 
-	// Create session with command and env vars via -e flags.
-	// The -e flags set session-level env BEFORE the shell starts, ensuring the
-	// initial shell inherits the correct GT_ROLE (not the parent's).
-	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
-	// See: https://github.com/steveyegge/gastown/issues/1289 (env inheritance fix)
-	if err := t.NewSessionWithCommandAndEnv(sessionID, worker.ClonePath, claudeCmd, envVars); err != nil {
-		return fmt.Errorf("creating session: %w", err)
+	// Prepend env vars into command (defense-in-depth, ensures initial shell inherits them)
+	claudeCmd = config.PrependEnv(claudeCmd, envVars)
+
+	// Create window in rig session. EnsureSession creates the rig session if needed.
+	created, err := t.EnsureSession(rigSess, worker.ClonePath)
+	if err != nil {
+		return fmt.Errorf("ensuring rig session %s: %w", rigSess, err)
+	}
+	if err := t.NewWindowWithCommand(rigSess, windowName, worker.ClonePath, claudeCmd); err != nil {
+		return fmt.Errorf("creating crew window: %w", err)
 	}
 
-	// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.AssignTheme(m.rig.Name)
-	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, name, "crew")
+	// Set agent metadata as window options
+	for k, v := range envVars {
+		_ = t.SetWindowOption(target, k, v)
+	}
+	// Shared session-level env vars (set once, idempotent)
+	if townRoot != "" {
+		_ = t.SetEnvironment(rigSess, "GT_ROOT", townRoot)
+	}
 
-	// Set up C-b n/p keybindings for crew session cycling (non-fatal)
-	_ = t.SetCrewCycleBindings(sessionID)
+	// Apply rig-based theming only when rig session first created (non-fatal)
+	if created {
+		theme := tmux.AssignTheme(m.rig.Name)
+		_ = t.ConfigureGasTownSession(rigSess, theme, m.rig.Name, name, "crew")
+	}
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
-	_ = session.TrackSessionPID(townRoot, sessionID, t)
+	_ = session.TrackSessionPID(townRoot, target, t)
+
+	// For non-hook runtimes (e.g. codex), inject startup fallback commands.
+	// This runs gt prime so role context is available even without SessionStart hooks.
+	_ = runtime.RunStartupFallback(t, target, "crew", runtimeConfig)
 
 	// Note: We intentionally don't wait for the agent to start here.
-	// The session is created in detached mode, and blocking for 60 seconds
+	// The window is created in detached mode, and blocking for 60 seconds
 	// serves no purpose. If the caller needs to know when the agent is ready,
 	// they can check with IsAgentAlive().
 
 	return nil
 }
 
-// Stop terminates a crew member's tmux session.
+// Stop terminates a crew member's tmux window.
 func (m *Manager) Stop(name string) error {
 	if err := validateCrewName(name); err != nil {
 		return err
 	}
 
 	t := tmux.NewTmux()
-	sessionID := m.SessionName(name)
+	rigSess := m.rigSession()
+	windowName := session.CrewWindowName(name)
 
-	// Check if session exists
-	running, err := t.HasSession(sessionID)
+	// Check if window exists
+	running, err := t.HasWindow(rigSess, windowName)
 	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
+		return fmt.Errorf("checking window: %w", err)
 	}
 	if !running {
 		return ErrSessionNotFound
 	}
 
-	// Kill the session.
-	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-	// This prevents orphan bash processes from Claude's Bash tool surviving session termination.
-	if err := t.KillSessionWithProcesses(sessionID); err != nil {
-		return fmt.Errorf("killing session: %w", err)
+	// Kill the window with all descendant processes.
+	if err := t.KillWindowWithProcesses(rigSess, windowName); err != nil {
+		return fmt.Errorf("killing window: %w", err)
 	}
 
 	return nil
 }
 
-// IsRunning checks if a crew member's session is active.
+// IsRunning checks if a crew member's window is active.
 func (m *Manager) IsRunning(name string) (bool, error) {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName(name)
-	return t.HasSession(sessionID)
+	return t.HasWindow(m.rigSession(), session.CrewWindowName(name))
 }

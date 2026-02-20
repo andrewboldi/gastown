@@ -127,6 +127,7 @@ var waitIdleTimeout = 15 * time.Second
 // For "wait-idle" mode: waits for idle, then delivers or falls back to queue.
 func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 	townRoot, _ := workspace.FindFromCwd()
+	supportsHooks := t.SessionSupportsHooks(sessionName)
 
 	// For direct tmux delivery, prefix with sender attribution.
 	// Queue-based delivery stores Sender as a separate field and
@@ -135,6 +136,10 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 
 	switch nudgeModeFlag {
 	case NudgeModeQueue:
+		if !supportsHooks {
+			fmt.Fprintf(os.Stderr, "Warning: session %s does not support hooks; delivering immediately\n", sessionName)
+			return t.NudgeSession(sessionName, prefixedMessage)
+		}
 		if townRoot == "" {
 			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
 		}
@@ -145,7 +150,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		})
 
 	case NudgeModeWaitIdle:
-		if townRoot == "" {
+		if townRoot == "" && supportsHooks {
 			// wait-idle needs workspace for queue fallback — fail explicitly
 			// rather than silently degrading to immediate (destructive) delivery.
 			return fmt.Errorf("--mode=wait-idle requires a Gas Town workspace")
@@ -160,6 +165,11 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// Queueing a nudge for a dead session means it will never be delivered.
 		if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
 			return fmt.Errorf("wait-idle: %w", err)
+		}
+		// Busy and hooks are unavailable — queue would never be drained.
+		if !supportsHooks {
+			fmt.Fprintf(os.Stderr, "Warning: session %s does not support hooks; delivering immediately\n", sessionName)
+			return t.NudgeSession(sessionName, prefixedMessage)
 		}
 		// Timeout (agent busy) — queue instead
 		if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
