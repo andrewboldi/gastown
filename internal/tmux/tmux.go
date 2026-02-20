@@ -1091,21 +1091,36 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 	return nil
 }
 
+// pane0Target returns a tmux target string pointing at pane 0.
+// For bare session names: "sess" → "sess:0.0"
+// For session:window targets: "sess:win" → "sess:win.0"
+// For pane IDs (%N): returns as-is.
+func pane0Target(target string) string {
+	if strings.HasPrefix(target, "%") {
+		return target
+	}
+	if strings.Contains(target, ":") {
+		return target + ".0"
+	}
+	return target + ":0.0"
+}
+
 // GetPaneCommand returns the current command running in a pane.
 // Returns "bash", "zsh", "claude", "node", etc.
-func (t *Tmux) GetPaneCommand(session string) (string, error) {
-	// Use display-message targeting pane 0 explicitly (:0.0) to avoid
+// target can be a session name, "session:window", or pane ID.
+func (t *Tmux) GetPaneCommand(target string) (string, error) {
+	// Use display-message targeting pane 0 explicitly to avoid
 	// returning the active pane's command in multi-pane sessions.
 	// Agent processes always run in pane 0; without explicit targeting,
 	// a user-created split pane (running a shell) could cause health
 	// checks to falsely report the agent as dead.
-	out, err := t.run("display-message", "-t", session+":0.0", "-p", "#{pane_current_command}")
+	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_current_command}")
 	if err != nil {
 		return "", err
 	}
 	result := strings.TrimSpace(out)
 	if result == "" {
-		return "", fmt.Errorf("empty command for session %s (session may not exist)", session)
+		return "", fmt.Errorf("empty command for target %s (session may not exist)", target)
 	}
 	return result, nil
 }
@@ -1133,8 +1148,8 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 		return "", nil
 	}
 
-	// Get agent process names from session environment
-	processNames := t.resolveSessionProcessNames(session)
+	// Get agent process names from target metadata.
+	processNames := t.resolveTargetProcessNames(session)
 
 	// Check each pane for agent process
 	for _, line := range lines {
@@ -1170,47 +1185,39 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 	return "", nil
 }
 
-// GetPaneID returns the pane identifier for a session's first pane.
+// GetPaneID returns the pane identifier for a target's first pane.
 // Returns a pane ID like "%0" that can be used with RespawnPane.
-// Targets pane 0 explicitly to be consistent with GetPaneCommand,
-// GetPanePID, and GetPaneWorkDir.
-func (t *Tmux) GetPaneID(session string) (string, error) {
-	out, err := t.run("display-message", "-t", session+":0.0", "-p", "#{pane_id}")
+// target can be a session name or "session:window" format.
+func (t *Tmux) GetPaneID(target string) (string, error) {
+	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_id}")
 	if err != nil {
 		return "", err
 	}
 	result := strings.TrimSpace(out)
 	if result == "" {
-		return "", fmt.Errorf("no panes found in session %s", session)
+		return "", fmt.Errorf("no panes found in target %s", target)
 	}
 	return result, nil
 }
 
 // GetPaneWorkDir returns the current working directory of a pane.
-// Targets pane 0 explicitly to avoid returning the active pane's
-// working directory in multi-pane sessions.
-func (t *Tmux) GetPaneWorkDir(session string) (string, error) {
-	out, err := t.run("display-message", "-t", session+":0.0", "-p", "#{pane_current_path}")
+// target can be a session name or "session:window" format.
+func (t *Tmux) GetPaneWorkDir(target string) (string, error) {
+	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_current_path}")
 	if err != nil {
 		return "", err
 	}
 	result := strings.TrimSpace(out)
 	if result == "" {
-		return "", fmt.Errorf("empty working directory for session %s (session may not exist)", session)
+		return "", fmt.Errorf("empty working directory for target %s (session may not exist)", target)
 	}
 	return result, nil
 }
 
 // GetPanePID returns the PID of the pane's main process.
-// When target is a session name, explicitly targets pane 0 (:0.0) to avoid
-// returning the active pane's PID in multi-pane sessions. When target is
-// a pane ID (e.g., "%5"), uses it directly.
+// target can be a session name, "session:window", or pane ID ("%N").
 func (t *Tmux) GetPanePID(target string) (string, error) {
-	tmuxTarget := target
-	if !strings.HasPrefix(target, "%") {
-		tmuxTarget = target + ":0.0"
-	}
-	out, err := t.run("display-message", "-t", tmuxTarget, "-p", "#{pane_pid}")
+	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_pid}")
 	if err != nil {
 		return "", err
 	}
@@ -1620,25 +1627,42 @@ func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 	return hasDescendantWithNames(pid, processNames, 0)
 }
 
-// IsAgentAlive checks if an agent is running in the session using agent-agnostic detection.
-// It reads GT_PROCESS_NAMES from the session environment for accurate process detection,
-// falling back to GT_AGENT-based lookup for legacy sessions.
-// This is the preferred method for zombie detection across all agent types.
-func (t *Tmux) IsAgentAlive(session string) bool {
-	return t.IsRuntimeRunning(session, t.resolveSessionProcessNames(session))
+// IsAgentAlive checks if an agent is running in the target using agent-agnostic detection.
+// It reads GT_PROCESS_NAMES/GT_AGENT from window options first, then session
+// environment, to support both legacy session-per-agent and window-per-rig
+// models. target can be a session name or "session:window" format.
+// target can be a session name or "session:window" format.
+func (t *Tmux) IsAgentAlive(target string) bool {
+	return t.IsRuntimeRunning(target, t.resolveTargetProcessNames(target))
 }
 
-// resolveSessionProcessNames returns the process names to check for a session.
-// Prefers GT_PROCESS_NAMES (set at startup, handles custom agents that shadow
-// built-in presets). Falls back to GT_AGENT-based lookup for legacy sessions.
-func (t *Tmux) resolveSessionProcessNames(session string) []string {
-	// Prefer explicit process names set at startup (handles custom agents correctly)
-	if names, err := t.GetEnvironment(session, "GT_PROCESS_NAMES"); err == nil && names != "" {
+// resolveTargetProcessNames returns process names for either session targets
+// or session:window targets. Window options take precedence in window mode.
+func (t *Tmux) resolveTargetProcessNames(target string) []string {
+	// Window-scoped process names are most specific in window-per-rig mode.
+	if strings.Contains(target, ":") {
+		if names, err := t.GetWindowOption(target, "GT_PROCESS_NAMES"); err == nil && names != "" {
+			return strings.Split(names, ",")
+		}
+		if agent, err := t.GetWindowOption(target, "GT_AGENT"); err == nil && agent != "" {
+			return config.GetProcessNames(agent)
+		}
+	}
+
+	// Fall back to session-scoped env.
+	sessionName := target
+	if i := strings.IndexByte(target, ':'); i >= 0 {
+		sessionName = target[:i]
+	}
+	if names, err := t.GetEnvironment(sessionName, "GT_PROCESS_NAMES"); err == nil && names != "" {
 		return strings.Split(names, ",")
 	}
-	// Fallback: resolve from agent name (built-in presets only)
-	agentName, _ := t.GetEnvironment(session, "GT_AGENT")
-	return config.GetProcessNames(agentName) // Returns Claude defaults if empty
+	if agent, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agent != "" {
+		return config.GetProcessNames(agent)
+	}
+
+	// Legacy fallback (Claude defaults).
+	return config.GetProcessNames("")
 }
 
 // WaitForCommand polls until the pane is NOT running one of the excluded commands.
@@ -2155,7 +2179,8 @@ var safePrefixRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,19}$`)
 // "hq" is always included because it lives outside the rig registry
 // (town-level services).
 //
-// Example output: "^(bd|db|fa|gl|gt|hq|la|lc)-"
+// Matches both legacy format ("gt-witness") and window-per-rig format ("gt", "hq").
+// Example output: "^(bd|db|fa|gl|gt|hq|la|lc)(-|$)"
 func sessionPrefixPattern() string {
 	seen := map[string]bool{"hq": true, "gt": true} // always include HQ + gastown fallback
 	townRoot := os.Getenv("GT_ROOT")
@@ -2171,7 +2196,8 @@ func sessionPrefixPattern() string {
 		sorted = append(sorted, p)
 	}
 	sort.Strings(sorted)
-	return "^(" + strings.Join(sorted, "|") + ")-"
+	// Match "prefix-" (legacy) or "prefix" at end of line (window-per-rig)
+	return "^(" + strings.Join(sorted, "|") + ")(-|$)"
 }
 
 // SetCycleBindings sets up C-b n/p to cycle through related sessions.
@@ -2560,4 +2586,3 @@ func (t *Tmux) GetWindowOption(target, key string) (string, error) {
 	}
 	return strings.TrimSpace(out), nil
 }
-
