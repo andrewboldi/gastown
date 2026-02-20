@@ -179,8 +179,11 @@ func isStalePolecatDone(workDir, rigName, polecatName string, msg *mail.Message)
 	}
 
 	initRegistryFromWorkDir(workDir)
-	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-	createdAt, err := session.SessionCreatedAt(sessionName)
+	// Use rig session for creation time — in window-per-rig mode the rig session
+	// hosts all agent windows. This is approximate; a window-level timestamp
+	// would be more precise but tmux doesn't track per-window creation time.
+	rigSess := session.RigSessionName(session.PrefixFor(rigName))
+	createdAt, err := session.SessionCreatedAt(rigSess)
 	if err != nil {
 		// Session not found or tmux not running - can't determine staleness, allow message
 		return false, ""
@@ -776,18 +779,20 @@ func NukePolecat(workDir, rigName, polecatName string) error {
 	// session due to rig loading issues or race conditions with IsRunning checks.
 	// See: gt-g9ft5 - sessions were piling up because nuke wasn't killing them.
 	initRegistryFromWorkDir(workDir)
-	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+	rigSess := session.RigSessionName(session.PrefixFor(rigName))
+	windowName := session.PolecatWindowName(polecatName)
+	target := session.PolecatTarget(session.PrefixFor(rigName), polecatName).String()
 	t := tmux.NewTmux()
 
-	// Check if session exists and kill it
-	if running, _ := t.HasSession(sessionName); running {
+	// Check if window exists and kill it
+	if running, _ := t.HasWindow(rigSess, windowName); running {
 		// Try graceful shutdown first (Ctrl-C), then force kill
-		_ = t.SendKeysRaw(sessionName, "C-c")
+		_ = t.SendKeysRaw(target, "C-c")
 		// Brief delay for graceful handling
 		time.Sleep(100 * time.Millisecond)
-		// Force kill the session
-		if err := t.KillSession(sessionName); err != nil {
-			// Log but continue - session might already be dead
+		// Force kill the window
+		if err := t.KillWindowWithProcesses(rigSess, windowName); err != nil {
+			// Log but continue - window might already be dead
 			// The important thing is we tried
 		}
 	}
@@ -998,15 +1003,19 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 		}
 
 		polecatName := entry.Name()
-		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+		rigSess := session.RigSessionName(session.PrefixFor(rigName))
+		windowName := session.PolecatWindowName(polecatName)
+		target := session.PolecatTarget(session.PrefixFor(rigName), polecatName).String()
 		result.Checked++
 
+		// Record timestamp BEFORE checking liveness for TOCTOU protection.
 		detectedAt := time.Now()
 
-		sessionAlive, err := t.HasSession(sessionName)
+		// Check if tmux window exists.
+		windowAlive, err := t.HasWindow(rigSess, windowName)
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("checking session %s: %w", sessionName, err))
+				fmt.Errorf("checking window %s: %w", target, err))
 			continue
 		}
 
@@ -1015,78 +1024,14 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 		labels := getAgentBeadLabels(workDir, agentBeadID)
 		doneIntent := extractDoneIntent(labels)
 
-		if sessionAlive {
-			if zombie, found := detectZombieLiveSession(workDir, rigName, polecatName, agentBeadID, sessionName, t, doneIntent, router); found {
+		if windowAlive {
+			if zombie, found := detectZombieLiveSession(workDir, rigName, polecatName, agentBeadID, target, rigSess, t, doneIntent, router); found {
 				result.Zombies = append(result.Zombies, zombie)
-			}
-
-			// Tmux session exists but agent process may have died inside it.
-			// This catches the "tmux-alive-but-agent-dead" zombie class that
-			// status.go detects but DetectZombiePolecats previously missed.
-			// See: gt-kj6r6
-			if !t.IsAgentAlive(sessionName) {
-				// Read hook bead before nuke (nuke may clean up agent bead)
-				_, deadAgentHookBead := getAgentBeadState(workDir, agentBeadID)
-				zombie := ZombieResult{
-					PolecatName: polecatName,
-					AgentState:  "agent-dead-in-session",
-					HookBead:    deadAgentHookBead,
-					Action:      "killed-agent-dead-session",
-				}
-				if err := NukePolecat(workDir, rigName, polecatName); err != nil {
-					zombie.Error = err
-					zombie.Action = fmt.Sprintf("kill-agent-dead-session-failed: %v", err)
-				}
-				// Reset abandoned bead for re-dispatch (gt-c3lgp)
-				zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, deadAgentHookBead, polecatName, router)
-				result.Zombies = append(result.Zombies, zombie)
-			} else {
-				// Agent is alive. Check if the hooked bead has been closed.
-				// A polecat that closed its bead but didn't run gt done is
-				// occupying a slot without doing work. See: gt-h1l6i
-				_, hookBead := getAgentBeadState(workDir, agentBeadID)
-				if hookBead != "" && getBeadStatus(workDir, hookBead) == "closed" {
-					zombie := ZombieResult{
-						PolecatName: polecatName,
-						AgentState:  "bead-closed-still-running",
-						HookBead:    hookBead,
-						Action:      "nuke-bead-closed-polecat",
-					}
-					if err := NukePolecat(workDir, rigName, polecatName); err != nil {
-						zombie.Error = err
-						zombie.Action = fmt.Sprintf("nuke-bead-closed-failed: %v", err)
-					}
-					result.Zombies = append(result.Zombies, zombie)
-				} else {
-					// Agent is alive and bead is not closed — check for hung session.
-					// A session where Claude is alive but has produced no tmux output
-					// for a long time is likely hung (infinite loop, crashed mid-call,
-					// or waiting for something that will never arrive). See: gt-tr3d
-					lastActivity, actErr := t.GetSessionActivity(sessionName)
-					if actErr == nil && !lastActivity.IsZero() {
-						inactiveMinutes := int(time.Since(lastActivity).Minutes())
-						if inactiveMinutes >= HungSessionThresholdMinutes {
-							_, hungHookBead := getAgentBeadState(workDir, agentBeadID)
-							zombie := ZombieResult{
-								PolecatName: polecatName,
-								AgentState:  "agent-hung",
-								HookBead:    hungHookBead,
-								Action:      fmt.Sprintf("killed-hung-session (inactive %dm)", inactiveMinutes),
-							}
-							if err := NukePolecat(workDir, rigName, polecatName); err != nil {
-								zombie.Error = err
-								zombie.Action = fmt.Sprintf("kill-hung-session-failed: %v", err)
-							}
-							zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, hungHookBead, polecatName, router)
-							result.Zombies = append(result.Zombies, zombie)
-						}
-					}
-				}
 			}
 			continue // Either handled or not a zombie
 		}
 
-		if zombie, found := detectZombieDeadSession(workDir, rigName, polecatName, agentBeadID, sessionName, t, doneIntent, detectedAt, router); found {
+		if zombie, found := detectZombieDeadSession(workDir, rigName, polecatName, agentBeadID, rigSess, windowName, t, doneIntent, detectedAt, router); found {
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
@@ -1094,9 +1039,9 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 	return result
 }
 
-// detectZombieLiveSession checks a polecat with a live tmux session for zombie indicators:
+// detectZombieLiveSession checks a polecat with a live tmux window for zombie indicators:
 // stuck done-intent, dead agent process, or closed bead while still running.
-func detectZombieLiveSession(workDir, rigName, polecatName, agentBeadID, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, router *mail.Router) (ZombieResult, bool) {
+func detectZombieLiveSession(workDir, rigName, polecatName, agentBeadID, target, rigSession string, t *tmux.Tmux, doneIntent *DoneIntent, router *mail.Router) (ZombieResult, bool) {
 	// Check for done-intent stuck too long (polecat hung in gt done).
 	if doneIntent != nil && time.Since(doneIntent.Timestamp) > 60*time.Second {
 		_, stuckHookBead := getAgentBeadState(workDir, agentBeadID)
@@ -1104,28 +1049,28 @@ func detectZombieLiveSession(workDir, rigName, polecatName, agentBeadID, session
 			PolecatName: polecatName,
 			AgentState:  "stuck-in-done",
 			HookBead:    stuckHookBead,
-			Action:      fmt.Sprintf("killed-stuck-session (done-intent age=%v)", time.Since(doneIntent.Timestamp).Round(time.Second)),
+			Action:      fmt.Sprintf("killed-stuck-window (done-intent age=%v)", time.Since(doneIntent.Timestamp).Round(time.Second)),
 		}
 		if err := NukePolecat(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
-			zombie.Action = fmt.Sprintf("kill-stuck-session-failed: %v", err)
+			zombie.Action = fmt.Sprintf("kill-stuck-window-failed: %v", err)
 		}
 		zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, stuckHookBead, polecatName, router)
 		return zombie, true
 	}
 
-	// Tmux alive but agent process dead (gt-kj6r6).
-	if !t.IsAgentAlive(sessionName) {
+	// Tmux window alive but agent process dead (gt-kj6r6).
+	if !t.IsAgentAlive(target) {
 		_, deadAgentHookBead := getAgentBeadState(workDir, agentBeadID)
 		zombie := ZombieResult{
 			PolecatName: polecatName,
-			AgentState:  "agent-dead-in-session",
+			AgentState:  "agent-dead-in-window",
 			HookBead:    deadAgentHookBead,
-			Action:      "killed-agent-dead-session",
+			Action:      "killed-agent-dead-window",
 		}
 		if err := NukePolecat(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
-			zombie.Action = fmt.Sprintf("kill-agent-dead-session-failed: %v", err)
+			zombie.Action = fmt.Sprintf("kill-agent-dead-window-failed: %v", err)
 		}
 		zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, deadAgentHookBead, polecatName, router)
 		return zombie, true
@@ -1147,12 +1092,31 @@ func detectZombieLiveSession(workDir, rigName, polecatName, agentBeadID, session
 		return zombie, true
 	}
 
+	// Coarse hung detection uses rig-session activity as a safeguard.
+	if lastActivity, actErr := t.GetSessionActivity(rigSession); actErr == nil && !lastActivity.IsZero() {
+		inactiveMinutes := int(time.Since(lastActivity).Minutes())
+		if inactiveMinutes >= HungSessionThresholdMinutes {
+			_, hungHookBead := getAgentBeadState(workDir, agentBeadID)
+			zombie := ZombieResult{
+				PolecatName: polecatName,
+				AgentState:  "agent-hung",
+				HookBead:    hungHookBead,
+				Action:      fmt.Sprintf("killed-hung-window (inactive %dm)", inactiveMinutes),
+			}
+			if err := NukePolecat(workDir, rigName, polecatName); err != nil {
+				zombie.Error = err
+				zombie.Action = fmt.Sprintf("kill-hung-window-failed: %v", err)
+			}
+			zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, hungHookBead, polecatName, router)
+			return zombie, true
+		}
+	}
+
 	return ZombieResult{}, false
 }
 
-// detectZombieDeadSession checks a polecat with a dead tmux session for zombie indicators:
-// stale done-intent, or active agent state / hooked bead with no session.
-func detectZombieDeadSession(workDir, rigName, polecatName, agentBeadID, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, router *mail.Router) (ZombieResult, bool) {
+// detectZombieDeadSession checks a polecat with a dead tmux window for zombie indicators.
+func detectZombieDeadSession(workDir, rigName, polecatName, agentBeadID, rigSession, windowName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, router *mail.Router) (ZombieResult, bool) {
 	// Done-intent: polecat was trying to exit.
 	if doneIntent != nil {
 		age := time.Since(doneIntent.Timestamp)
@@ -1180,8 +1144,8 @@ func detectZombieDeadSession(workDir, rigName, polecatName, agentBeadID, session
 		return ZombieResult{}, false
 	}
 
-	// TOCTOU guard: verify session wasn't recreated since detection.
-	if sessionRecreated(t, sessionName, detectedAt) {
+	// TOCTOU guard: verify window wasn't recreated since detection.
+	if windowRecreated(t, rigSession, windowName, detectedAt) {
 		return ZombieResult{}, false
 	}
 
@@ -1306,28 +1270,30 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 		}
 
 		polecatName := entry.Name()
-		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+		rigSess := session.RigSessionName(session.PrefixFor(rigName))
+		windowName := session.PolecatWindowName(polecatName)
+		target := session.PolecatTarget(session.PrefixFor(rigName), polecatName).String()
 		result.Checked++
 
-		// Only check live sessions with alive agents (the opposite of zombie detection)
-		sessionAlive, err := t.HasSession(sessionName)
+		// Only check live windows with alive agents (the opposite of zombie detection)
+		windowAlive, err := t.HasWindow(rigSess, windowName)
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("checking session %s: %w", sessionName, err))
+				fmt.Errorf("checking window %s: %w", target, err))
 			continue
 		}
-		if !sessionAlive {
-			continue // Dead session — zombie detection handles this
+		if !windowAlive {
+			continue // Dead window — zombie detection handles this
 		}
-		if !t.IsAgentAlive(sessionName) {
+		if !t.IsAgentAlive(target) {
 			continue // Dead agent — zombie detection handles this
 		}
 
 		// Agent is alive. Capture pane to check for known stall patterns.
-		content, err := t.CapturePane(sessionName, 30)
+		content, err := t.CapturePane(target, 30)
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("capturing pane for %s: %w", sessionName, err))
+				fmt.Errorf("capturing pane for %s: %w", target, err))
 			continue
 		}
 
@@ -1337,7 +1303,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 				PolecatName: polecatName,
 				StallType:   "bypass-permissions",
 			}
-			if err := t.AcceptBypassPermissionsWarning(sessionName); err != nil {
+			if err := t.AcceptBypassPermissionsWarning(target); err != nil {
 				stalled.Action = "escalated"
 				stalled.Error = fmt.Errorf("auto-dismiss failed: %w", err)
 			} else {
@@ -1509,19 +1475,21 @@ func DetectOrphanedBeads(workDir, rigName string, router *mail.Router) *DetectOr
 		}
 		result.Checked++
 
-		// Check if the polecat's tmux session exists
-		sessionName := session.PolecatSessionName(session.PrefixFor(assigneeRig), polecatName)
-		sessionAlive, err := t.HasSession(sessionName)
+		// Check if the polecat's tmux window exists
+		rigSess := session.RigSessionName(session.PrefixFor(assigneeRig))
+		windowName := session.PolecatWindowName(polecatName)
+		target := session.PolecatTarget(session.PrefixFor(assigneeRig), polecatName).String()
+		windowAlive, err := t.HasWindow(rigSess, windowName)
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("checking session %s for bead %s: %w", sessionName, bead.ID, err))
+				fmt.Errorf("checking window %s for bead %s: %w", target, bead.ID, err))
 			continue
 		}
-		if sessionAlive {
+		if windowAlive {
 			continue // Polecat is alive — not an orphan
 		}
 
-		// Session is dead. Also check if polecat directory still exists
+		// Window is dead. Also check if polecat directory still exists
 		// (if dir exists, DetectZombiePolecats will handle it)
 		polecatsDir := filepath.Join(townRoot, assigneeRig, "polecats", polecatName)
 		if _, statErr := os.Stat(polecatsDir); statErr == nil {
@@ -1533,7 +1501,7 @@ func DetectOrphanedBeads(workDir, rigName string, router *mail.Router) *DetectOr
 			continue
 		}
 
-		// Re-check directory and session immediately before reset to narrow the
+		// Re-check directory and window immediately before reset to narrow the
 		// TOCTOU window — a polecat could have been recreated between the first
 		// checks and now.
 		if _, statErr := os.Stat(polecatsDir); statErr == nil {
@@ -1543,8 +1511,8 @@ func DetectOrphanedBeads(workDir, rigName string, router *mail.Router) *DetectOr
 				fmt.Errorf("re-checking polecat dir %s for bead %s: %w", polecatsDir, bead.ID, statErr))
 			continue
 		}
-		if alive, _ := t.HasSession(sessionName); alive {
-			continue // Session reappeared — polecat was respawned, not an orphan
+		if alive, _ := t.HasWindow(rigSess, windowName); alive {
+			continue // Window reappeared — polecat was respawned, not an orphan
 		}
 
 		// Polecat is truly gone (no session, no directory). Reset the bead.
@@ -1641,15 +1609,17 @@ func DetectOrphanedMolecules(workDir, rigName string, router *mail.Router) *Dete
 		polecatName := strings.TrimPrefix(b.Assignee, polecatPrefix)
 		result.Checked++
 
-		// Check if polecat still has a tmux session
-		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-		hasSession, sessionErr := t.HasSession(sessionName)
-		if sessionErr != nil {
+		// Check if polecat still has a tmux window
+		rigSess := session.RigSessionName(session.PrefixFor(rigName))
+		windowName := session.PolecatWindowName(polecatName)
+		target := session.PolecatTarget(session.PrefixFor(rigName), polecatName).String()
+		hasWindow, windowErr := t.HasWindow(rigSess, windowName)
+		if windowErr != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("checking session %s for bead %s: %w", sessionName, b.ID, sessionErr))
+				fmt.Errorf("checking window %s for bead %s: %w", target, b.ID, windowErr))
 			continue
 		}
-		if hasSession {
+		if hasWindow {
 			continue // Polecat is alive
 		}
 
@@ -1673,8 +1643,8 @@ func DetectOrphanedMolecules(workDir, rigName string, router *mail.Router) *Dete
 				fmt.Errorf("re-checking polecat dir %s for bead %s: %w", polecatDir, b.ID, statErr))
 			continue
 		}
-		if alive, _ := t.HasSession(sessionName); alive {
-			continue // Session reappeared — polecat was respawned
+		if alive, _ := t.HasWindow(rigSess, windowName); alive {
+			continue // Window reappeared — polecat was respawned
 		}
 
 		// Polecat is dead and gone — read the full bead to check for attached molecule
@@ -1877,6 +1847,18 @@ func sessionRecreated(t *tmux.Tmux, sessionName string, detectedAt time.Time) bo
 		return true
 	}
 	return !createdAt.Before(detectedAt)
+}
+
+// windowRecreated checks if a window was recreated after detectedAt.
+// In window-per-rig mode, tmux doesn't track per-window creation time,
+// so we conservatively return true if the window exists (assume recreated).
+func windowRecreated(t *tmux.Tmux, sess, windowName string, _ time.Time) bool {
+	alive, err := t.HasWindow(sess, windowName)
+	if err != nil || !alive {
+		return false // Still dead — not recreated
+	}
+	// Window exists — conservatively assume recreated to avoid killing live agents.
+	return true
 }
 
 // findAnyCleanupWisp checks if any cleanup wisp already exists for a polecat,
