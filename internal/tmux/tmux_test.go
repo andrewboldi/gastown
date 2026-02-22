@@ -1775,7 +1775,7 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 func TestMatchesPromptPrefix(t *testing.T) {
 	const (
 		nbsp          = "\u00a0" // non-breaking space
-		regularPrefix = "❯ "    // default: ❯ + regular space
+		regularPrefix = "❯ "     // default: ❯ + regular space
 	)
 
 	tests := []struct {
@@ -1997,7 +1997,7 @@ func TestSessionPrefixPattern_AlwaysIncludesGTAndHQ(t *testing.T) {
 		t.Errorf("pattern %q missing 'hq'", pattern)
 	}
 	// Must be a valid grep -Eq anchored alternation
-	if !strings.HasPrefix(pattern, "^(") || !strings.HasSuffix(pattern, ")-") {
+	if !strings.HasPrefix(pattern, "^(") || !strings.HasSuffix(pattern, ")(-|$)") {
 		t.Errorf("pattern %q has unexpected format", pattern)
 	}
 }

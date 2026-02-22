@@ -14,12 +14,13 @@ import (
 )
 
 // writeFakeTestTmux creates a shell script in dir named "tmux" that simulates
-// "session not found" for has-session calls and fails on anything else.
+// "session not found" for both has-session and list-windows calls.
 func writeFakeTestTmux(t *testing.T, dir string) {
 	t.Helper()
 	script := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
 		"  *has-session*) echo \"can't find session\" >&2; exit 1;;\n" +
+		"  *list-windows*) echo \"can't find session\" >&2; exit 1;;\n" +
 		"  *) echo 'unexpected tmux command' >&2; exit 1;;\n" +
 		"esac\n"
 	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0755); err != nil {
