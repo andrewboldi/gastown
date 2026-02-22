@@ -758,7 +758,95 @@ func (t *Tmux) ListSessions() ([]string, error) {
 		return nil, nil
 	}
 
-	return strings.Split(out, "\n"), nil
+	base := strings.Split(out, "\n")
+	seen := make(map[string]struct{}, len(base))
+	result := make([]string, 0, len(base))
+	for _, s := range base {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		result = append(result, s)
+	}
+
+	// Compatibility aliases: synthesize legacy per-agent session names from
+	// window-per-rig sessions so existing command surfaces keep working.
+	for _, sess := range base {
+		for _, alias := range t.legacyAliasesForSession(sess) {
+			if _, ok := seen[alias]; ok {
+				continue
+			}
+			seen[alias] = struct{}{}
+			result = append(result, alias)
+		}
+	}
+
+	return result, nil
+}
+
+// legacyAliasesForSession returns legacy per-agent session aliases for GT
+// windows in a session. Examples: hq:mayor -> hq-mayor, gt:witness -> gt-witness.
+func (t *Tmux) legacyAliasesForSession(session string) []string {
+	format := "#{window_name}\t#{@GT_ROLE}"
+	out, err := t.run("list-windows", "-t", "="+session, "-F", format)
+	if err != nil || out == "" {
+		return nil
+	}
+
+	aliases := make([]string, 0, 8)
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		window := strings.TrimSpace(parts[0])
+		role := ""
+		if len(parts) == 2 {
+			role = strings.TrimSpace(parts[1])
+		}
+		if window == "" {
+			continue
+		}
+		if alias, ok := legacyAliasForWindow(session, window, role); ok {
+			aliases = append(aliases, alias)
+		}
+	}
+	return aliases
+}
+
+func legacyAliasForWindow(session, window, role string) (string, bool) {
+	if session == "hq" {
+		switch {
+		case role == "mayor" || window == "mayor":
+			return "hq-mayor", true
+		case role == "deacon" || window == "deacon":
+			return "hq-deacon", true
+		case role == "boot" || window == "boot":
+			return "hq-boot", true
+		case role == "overseer" || window == "overseer":
+			return "hq-overseer", true
+		case role == "dog" || strings.HasPrefix(window, "dog-"):
+			return "hq-" + window, true
+		default:
+			return "", false
+		}
+	}
+
+	switch {
+	case role == "witness" || window == "witness":
+		return session + "-witness", true
+	case role == "refinery" || window == "refinery":
+		return session + "-refinery", true
+	case role == "crew" || strings.HasPrefix(window, "crew-"):
+		return session + "-" + window, true
+	case role == "polecat":
+		return session + "-" + window, true
+	default:
+		return "", false
+	}
 }
 
 // SessionSet provides O(1) session existence checks by caching session names.
@@ -785,33 +873,16 @@ func NewSessionSet(names []string) *SessionSet {
 //
 // Builds the map directly from tmux output to avoid intermediate slice allocation.
 func (t *Tmux) GetSessionSet() (*SessionSet, error) {
-	out, err := t.run("list-sessions", "-F", "#{session_name}")
+	sessions, err := t.ListSessions()
 	if err != nil {
-		if errors.Is(err, ErrNoServer) {
-			return &SessionSet{sessions: make(map[string]struct{})}, nil
-		}
 		return nil, err
 	}
-
-	// Count newlines to pre-size map (avoids rehashing during insertion)
-	count := strings.Count(out, "\n") + 1
 	set := &SessionSet{
-		sessions: make(map[string]struct{}, count),
+		sessions: make(map[string]struct{}, len(sessions)),
 	}
-
-	// Parse directly without intermediate slice allocation
-	for len(out) > 0 {
-		idx := strings.IndexByte(out, '\n')
-		var line string
-		if idx >= 0 {
-			line = out[:idx]
-			out = out[idx+1:]
-		} else {
-			line = out
-			out = ""
-		}
-		if line != "" {
-			set.sessions[line] = struct{}{}
+	for _, name := range sessions {
+		if name != "" {
+			set.sessions[name] = struct{}{}
 		}
 	}
 	return set, nil

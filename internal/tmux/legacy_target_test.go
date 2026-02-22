@@ -47,3 +47,37 @@ func TestLegacySessionWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestLegacyAliasForWindow(t *testing.T) {
+	tests := []struct {
+		name    string
+		session string
+		window  string
+		role    string
+		want    string
+		wantOK  bool
+	}{
+		{name: "hq mayor by window", session: "hq", window: "mayor", want: "hq-mayor", wantOK: true},
+		{name: "hq dog by role", session: "hq", window: "dog-rufus", role: "dog", want: "hq-dog-rufus", wantOK: true},
+		{name: "rig witness by role", session: "gt", window: "witness", role: "witness", want: "gt-witness", wantOK: true},
+		{name: "rig crew by window", session: "gt", window: "crew-max", want: "gt-crew-max", wantOK: true},
+		{name: "rig polecat by role", session: "gt", window: "Toast", role: "polecat", want: "gt-Toast", wantOK: true},
+		{name: "skip feed window", session: "gt", window: "feed", wantOK: false},
+		{name: "skip unknown hq", session: "hq", window: "misc", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := legacyAliasForWindow(tt.session, tt.window, tt.role)
+			if ok != tt.wantOK {
+				t.Fatalf("legacyAliasForWindow(%q,%q,%q) ok=%v, want %v", tt.session, tt.window, tt.role, ok, tt.wantOK)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if got != tt.want {
+				t.Fatalf("legacyAliasForWindow(%q,%q,%q) = %q, want %q", tt.session, tt.window, tt.role, got, tt.want)
+			}
+		})
+	}
+}
