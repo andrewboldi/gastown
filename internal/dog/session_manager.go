@@ -2,9 +2,9 @@
 package dog
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"errors"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/cli"
 	"os"
 	"path/filepath"
 	"time"
@@ -70,8 +70,24 @@ type SessionInfo struct {
 // Dogs are town-level (managed by deacon), so they use the hq- prefix.
 // We use "hq-dog-" instead of "hq-deacon-" to avoid tmux prefix-matching
 // collisions with the "hq-deacon" session.
+// Deprecated: Use Target() for window-per-rig mode.
 func (m *SessionManager) SessionName(dogName string) string {
 	return fmt.Sprintf("hq-dog-%s", dogName)
+}
+
+// rigSession returns the shared tmux session for town-level agents.
+func (m *SessionManager) rigSession() string {
+	return session.HQSessionName()
+}
+
+// windowName returns the tmux window name for a dog.
+func (m *SessionManager) windowName(dogName string) string {
+	return "dog-" + dogName
+}
+
+// Target returns the tmux target for a dog window (e.g., "hq:dog-rufus").
+func (m *SessionManager) Target(dogName string) session.TmuxTarget {
+	return session.NewTarget(m.rigSession(), m.windowName(dogName))
 }
 
 // kennelPath returns the path to the dog's kennel directory.
@@ -79,7 +95,7 @@ func (m *SessionManager) kennelPath(dogName string) string {
 	return filepath.Join(m.townRoot, "deacon", "dogs", dogName)
 }
 
-// Start creates and starts a new session for a dog.
+// Start creates and starts a new window for a dog.
 // Dogs run agent sessions that check mail for work and execute formulas.
 func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	kennelDir := m.kennelPath(dogName)
@@ -87,12 +103,23 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 		return fmt.Errorf("%w: %s", ErrDogNotFound, dogName)
 	}
 
-	sessionID := m.SessionName(dogName)
+	rigSess := m.rigSession()
+	windowName := m.windowName(dogName)
+	target := m.Target(dogName).String()
 
-	// Kill any existing zombie session (tmux alive but agent dead).
-	_, err := session.KillExistingSession(m.tmux, sessionID, true)
+	// Check if window already exists.
+	running, err := m.tmux.HasWindow(rigSess, windowName)
 	if err != nil {
-		return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		return fmt.Errorf("checking window: %w", err)
+	}
+	if running {
+		if m.tmux.IsAgentAlive(target) {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, target)
+		}
+		// Zombie window - kill and recreate.
+		if err := m.tmux.KillWindowWithProcesses(rigSess, windowName); err != nil {
+			return fmt.Errorf("killing zombie window: %w", err)
+		}
 	}
 
 	// Build instructions for the dog
@@ -105,11 +132,12 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	// Use unified session lifecycle.
 	theme := tmux.DogTheme()
 	_, err = session.StartSession(m.tmux, session.SessionConfig{
-		SessionID: sessionID,
-		WorkDir:   kennelDir,
-		Role:      "dog",
-		TownRoot:  m.townRoot,
-		AgentName: dogName,
+		SessionID:  rigSess,
+		WindowName: windowName,
+		WorkDir:    kennelDir,
+		Role:       "dog",
+		TownRoot:   m.townRoot,
+		AgentName:  dogName,
 		Beacon: session.BeaconConfig{
 			Recipient: session.BeaconRecipient("dog", dogName, ""),
 			Sender:    "deacon",
@@ -142,11 +170,13 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 
 // Stop terminates a dog session.
 func (m *SessionManager) Stop(dogName string, force bool) error {
-	sessionID := m.SessionName(dogName)
+	rigSess := m.rigSession()
+	windowName := m.windowName(dogName)
+	target := m.Target(dogName).String()
 
-	running, err := m.tmux.HasSession(sessionID)
+	running, err := m.tmux.HasWindow(rigSess, windowName)
 	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
+		return fmt.Errorf("checking window: %w", err)
 	}
 	if !running {
 		return ErrSessionNotFound
@@ -154,12 +184,12 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 
 	// Try graceful shutdown first
 	if !force {
-		_ = m.tmux.SendKeysRaw(sessionID, "C-c")
-		session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout)
+		_ = m.tmux.SendKeysRaw(target, "C-c")
+		session.WaitForWindowExit(m.tmux, rigSess, windowName, constants.GracefulShutdownTimeout)
 	}
 
-	if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
-		return fmt.Errorf("killing session: %w", err)
+	if err := m.tmux.KillWindowWithProcesses(rigSess, windowName); err != nil {
+		return fmt.Errorf("killing window: %w", err)
 	}
 
 	// Update persistent state to idle so dog is available for reassignment
@@ -174,22 +204,31 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 
 // IsRunning checks if a dog session is active.
 func (m *SessionManager) IsRunning(dogName string) (bool, error) {
-	sessionID := m.SessionName(dogName)
-	return m.tmux.HasSession(sessionID)
+	rigSess := m.rigSession()
+	windowName := m.windowName(dogName)
+	target := m.Target(dogName).String()
+
+	hasWindow, err := m.tmux.HasWindow(rigSess, windowName)
+	if err != nil || !hasWindow {
+		return false, err
+	}
+	return m.tmux.IsAgentAlive(target), nil
 }
 
 // Status returns detailed status for a dog session.
 func (m *SessionManager) Status(dogName string) (*SessionInfo, error) {
-	sessionID := m.SessionName(dogName)
+	rigSess := m.rigSession()
+	windowName := m.windowName(dogName)
+	target := m.Target(dogName).String()
 
-	running, err := m.tmux.HasSession(sessionID)
+	running, err := m.tmux.HasWindow(rigSess, windowName)
 	if err != nil {
-		return nil, fmt.Errorf("checking session: %w", err)
+		return nil, fmt.Errorf("checking window: %w", err)
 	}
 
 	info := &SessionInfo{
 		DogName:   dogName,
-		SessionID: sessionID,
+		SessionID: target,
 		Running:   running,
 	}
 
@@ -197,7 +236,7 @@ func (m *SessionManager) Status(dogName string) (*SessionInfo, error) {
 		return info, nil
 	}
 
-	tmuxInfo, err := m.tmux.GetSessionInfo(sessionID)
+	tmuxInfo, err := m.tmux.GetSessionInfo(rigSess)
 	if err != nil {
 		return info, nil
 	}
@@ -209,18 +248,20 @@ func (m *SessionManager) Status(dogName string) (*SessionInfo, error) {
 
 // GetPane returns the pane ID for a dog session.
 func (m *SessionManager) GetPane(dogName string) (string, error) {
-	sessionID := m.SessionName(dogName)
+	rigSess := m.rigSession()
+	windowName := m.windowName(dogName)
+	target := m.Target(dogName).String()
 
-	running, err := m.tmux.HasSession(sessionID)
+	running, err := m.tmux.HasWindow(rigSess, windowName)
 	if err != nil {
-		return "", fmt.Errorf("checking session: %w", err)
+		return "", fmt.Errorf("checking window: %w", err)
 	}
 	if !running {
 		return "", ErrSessionNotFound
 	}
 
-	// Get pane ID from session
-	pane, err := m.tmux.GetPaneID(sessionID)
+	// Get pane ID from target window
+	pane, err := m.tmux.GetPaneID(target)
 	if err != nil {
 		return "", fmt.Errorf("getting pane: %w", err)
 	}

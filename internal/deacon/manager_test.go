@@ -45,7 +45,7 @@ func (m *mockTmux) NewSessionWithCommand(_, _, _ string) error {
 }
 
 func (m *mockTmux) SetRemainOnExit(_ string, _ bool) error { return nil }
-func (m *mockTmux) SetEnvironment(_, _, _ string) error     { return nil }
+func (m *mockTmux) SetEnvironment(_, _, _ string) error    { return nil }
 func (m *mockTmux) ConfigureGasTownSession(_ string, _ tmux.Theme, _, _, _ string) error {
 	return nil
 }
@@ -54,12 +54,29 @@ func (m *mockTmux) WaitForCommand(_ string, _ []string, _ time.Duration) error {
 	return m.waitErr
 }
 
-func (m *mockTmux) SetAutoRespawnHook(_ string) error              { return nil }
-func (m *mockTmux) AcceptBypassPermissionsWarning(_ string) error  { return nil }
-func (m *mockTmux) SendKeysRaw(_, _ string) error                  { return m.sendKeysErr }
+func (m *mockTmux) SetAutoRespawnHook(_ string) error             { return nil }
+func (m *mockTmux) AcceptBypassPermissionsWarning(_ string) error { return nil }
+func (m *mockTmux) SendKeysRaw(_, _ string) error                 { return m.sendKeysErr }
 func (m *mockTmux) GetSessionInfo(_ string) (*tmux.SessionInfo, error) {
 	return m.sessionInfo, m.sessionInfoErr
 }
+func (m *mockTmux) HasWindow(_, _ string) (bool, error) {
+	return m.hasSessionResult, m.hasSessionErr
+}
+
+func (m *mockTmux) KillWindowWithProcesses(session, window string) error {
+	m.killCalls = append(m.killCalls, session+":"+window)
+	return m.killErr
+}
+
+func (m *mockTmux) EnsureSession(_, _ string) (bool, error) { return false, nil }
+
+func (m *mockTmux) NewWindowWithCommand(_, _, _, _ string) error {
+	m.newSessionCalls++
+	return m.newSessionErr
+}
+
+func (m *mockTmux) SetWindowOption(_, _, _ string) error { return nil }
 
 func newTestManager(townRoot string, mock *mockTmux) *Manager {
 	return &Manager{
@@ -130,8 +147,8 @@ func TestStart_ZombieDetected_KillFails(t *testing.T) {
 	if len(mock.killCalls) != 1 {
 		t.Errorf("expected 1 kill call, got %d", len(mock.killCalls))
 	}
-	if len(mock.killCalls) > 0 && mock.killCalls[0] != m.SessionName() {
-		t.Errorf("killed session %q, want %q", mock.killCalls[0], m.SessionName())
+	if len(mock.killCalls) > 0 && mock.killCalls[0] != m.Target().String() {
+		t.Errorf("killed target %q, want %q", mock.killCalls[0], m.Target().String())
 	}
 }
 
@@ -307,11 +324,11 @@ func TestStop_KillFails(t *testing.T) {
 
 func TestIsRunning(t *testing.T) {
 	tests := []struct {
-		name     string
-		running  bool
-		err      error
-		wantRun  bool
-		wantErr  bool
+		name    string
+		running bool
+		err     error
+		wantRun bool
+		wantErr bool
 	}{
 		{
 			name:    "running",
@@ -335,6 +352,7 @@ func TestIsRunning(t *testing.T) {
 			mock := &mockTmux{
 				hasSessionResult: tc.running,
 				hasSessionErr:    tc.err,
+				agentAlive:       tc.running,
 			}
 			m := newTestManager(t.TempDir(), mock)
 
@@ -385,7 +403,7 @@ func TestStatus_HasSessionError(t *testing.T) {
 
 func TestStatus_Running(t *testing.T) {
 	expected := &tmux.SessionInfo{
-		Name:    "hq-deacon",
+		Name:    "hq",
 		Windows: 1,
 	}
 	mock := &mockTmux{

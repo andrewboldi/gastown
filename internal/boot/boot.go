@@ -4,9 +4,9 @@
 package boot
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"encoding/json"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/cli"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,9 +76,9 @@ func (b *Boot) IsRunning() bool {
 	return b.IsSessionAlive()
 }
 
-// IsSessionAlive checks if the Boot tmux session exists.
+// IsSessionAlive checks if the Boot window exists in the hq session.
 func (b *Boot) IsSessionAlive() bool {
-	has, err := b.tmux.HasSession(session.BootSessionName())
+	has, err := b.tmux.HasWindow(session.HQSessionName(), session.BootWindowName())
 	return err == nil && has
 }
 
@@ -149,14 +149,14 @@ func (b *Boot) LoadStatus() (*Status, error) {
 	return &status, nil
 }
 
-// Spawn starts Boot in a fresh tmux session.
+// Spawn starts Boot in a fresh tmux window.
 // Boot runs the mol-boot-triage molecule and exits when done.
 // In degraded mode (no tmux), it runs in a subprocess.
 // The agentOverride parameter allows specifying an agent alias to use instead of the town default.
-// Boot is ephemeral - each spawn kills any existing session and starts fresh.
+// Boot is ephemeral - each spawn kills any existing window and starts fresh.
 func (b *Boot) Spawn(agentOverride string) error {
 	// No IsRunning() guard here - Boot is ephemeral by design.
-	// spawnTmux() kills any existing session before spawning fresh.
+	// spawnTmux() kills any existing window before spawning fresh.
 
 	// Check for degraded mode
 	if b.degraded {
@@ -166,11 +166,11 @@ func (b *Boot) Spawn(agentOverride string) error {
 	return b.spawnTmux(agentOverride)
 }
 
-// spawnTmux spawns Boot in a tmux session.
+// spawnTmux spawns Boot in a tmux window within the shared hq session.
 func (b *Boot) spawnTmux(agentOverride string) error {
-	// Kill any stale session first (Boot is ephemeral).
+	// Kill any stale window first (Boot is ephemeral).
 	if b.IsSessionAlive() {
-		_ = b.tmux.KillSessionWithProcesses(session.BootSessionName())
+		_ = b.tmux.KillWindowWithProcesses(session.HQSessionName(), session.BootWindowName())
 	}
 
 	// Ensure boot directory exists (it should have CLAUDE.md with Boot context)
@@ -180,10 +180,11 @@ func (b *Boot) spawnTmux(agentOverride string) error {
 
 	// Use unified session lifecycle for config → settings → command → create → env.
 	_, err := session.StartSession(b.tmux, session.SessionConfig{
-		SessionID: session.BootSessionName(),
-		WorkDir:   b.bootDir,
-		Role:      "boot",
-		TownRoot:  b.townRoot,
+		SessionID:  session.HQSessionName(),
+		WindowName: session.BootWindowName(),
+		WorkDir:    b.bootDir,
+		Role:       "boot",
+		TownRoot:   b.townRoot,
 		Beacon: session.BeaconConfig{
 			Recipient: "boot",
 			Sender:    "daemon",

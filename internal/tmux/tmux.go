@@ -57,6 +57,83 @@ func validateSessionName(name string) error {
 	return nil
 }
 
+// legacySessionWindow maps legacy Gas Town session-per-agent names to the
+// window-per-rig target parts. Returns (session, window, true) when name is a
+// legacy agent session name (e.g., "hq-mayor", "gt-witness", "gt-crew-max").
+func legacySessionWindow(name string) (string, string, bool) {
+	if name == "" || strings.Contains(name, ":") || strings.HasPrefix(name, "%") {
+		return "", "", false
+	}
+
+	// Town-level legacy sessions.
+	if strings.HasPrefix(name, "hq-") {
+		suffix := strings.TrimPrefix(name, "hq-")
+		switch {
+		case suffix == "mayor", suffix == "deacon", suffix == "boot", suffix == "overseer":
+			return "hq", suffix, true
+		case strings.HasPrefix(suffix, "dog-") && len(suffix) > len("dog-"):
+			return "hq", suffix, true
+		default:
+			return "", "", false
+		}
+	}
+
+	// Rig-level legacy sessions: <prefix>-<rest>.
+	parts := strings.SplitN(name, "-", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	prefix := parts[0]
+	rest := parts[1]
+
+	switch {
+	case rest == "witness":
+		return prefix, "witness", true
+	case rest == "refinery":
+		return prefix, "refinery", true
+	case strings.HasPrefix(rest, "crew-") && len(rest) > len("crew-"):
+		return prefix, rest, true
+	default:
+		// Polecat legacy format: <prefix>-<name>.
+		return prefix, rest, true
+	}
+}
+
+// hasSessionExact checks for an exact tmux session match only (no legacy mapping).
+func (t *Tmux) hasSessionExact(name string) (bool, error) {
+	_, err := t.run("has-session", "-t", "="+name)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// normalizeTarget resolves legacy session-per-agent names to window targets
+// when the underlying rig/hq session exists.
+func (t *Tmux) normalizeTarget(target string) string {
+	if target == "" || strings.HasPrefix(target, "%") || strings.Contains(target, ":") {
+		return target
+	}
+
+	// Keep exact sessions as-is (legacy compatibility / non-GT sessions).
+	if has, err := t.hasSessionExact(target); err == nil && has {
+		return target
+	}
+
+	// Otherwise, map known legacy GT names to session:window when possible.
+	sess, window, ok := legacySessionWindow(target)
+	if !ok {
+		return target
+	}
+	if has, err := t.hasSessionExact(sess); err == nil && has {
+		return sess + ":" + window
+	}
+	return target
+}
+
 // Tmux wraps tmux operations.
 type Tmux struct{}
 
@@ -228,6 +305,21 @@ func (t *Tmux) EnsureSessionFresh(name, workDir string) error {
 // KillSession terminates a tmux session.
 func (t *Tmux) KillSession(name string) (retErr error) {
 	defer func() { telemetry.RecordSessionStop(context.Background(), name, retErr) }()
+
+	// Prefer exact session kill when present.
+	if has, err := t.hasSessionExact(name); err == nil && !has {
+		// Legacy GT session name in window-per-rig mode: kill the mapped window.
+		if sess, window, ok := legacySessionWindow(name); ok {
+			if err := t.KillWindow(sess, window); err != nil {
+				if errors.Is(err, ErrWindowNotFound) || errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
 	_, retErr = t.run("kill-session", "-t", name)
 	return retErr
 }
@@ -255,6 +347,14 @@ const processKillGracePeriod = 2 * time.Second
 //
 // This ensures Claude processes and all their children are properly terminated.
 func (t *Tmux) KillSessionWithProcesses(name string) error {
+	// Prefer exact session kill when present.
+	if has, err := t.hasSessionExact(name); err == nil && !has {
+		// Legacy GT session name in window-per-rig mode: kill mapped window.
+		if sess, window, ok := legacySessionWindow(name); ok {
+			return t.KillWindowWithProcesses(sess, window)
+		}
+	}
+
 	// Get the pane PID
 	pid, err := t.GetPanePID(name)
 	if err != nil {
@@ -323,6 +423,15 @@ func (t *Tmux) KillSessionWithProcesses(name string) error {
 // the calling process (e.g., gt done) is running inside the session it's terminating.
 // Without exclusion, the caller would be killed before completing the cleanup.
 func (t *Tmux) KillSessionWithProcessesExcluding(name string, excludePIDs []string) error {
+	// If this is a legacy GT session name in window-per-rig mode, exclusions are
+	// currently unsupported for window-scoped kill paths; fall back to normal
+	// window kill semantics.
+	if has, err := t.hasSessionExact(name); err == nil && !has {
+		if sess, window, ok := legacySessionWindow(name); ok {
+			return t.KillWindowWithProcesses(sess, window)
+		}
+	}
+
 	// Build exclusion set for O(1) lookup
 	exclude := make(map[string]bool)
 	for _, pid := range excludePIDs {
@@ -615,18 +724,24 @@ func (t *Tmux) IsAvailable() bool {
 	return cmd.Run() == nil
 }
 
-// HasSession checks if a session exists (exact match).
-// Uses "=" prefix for exact matching, preventing prefix matches
-// (e.g., "gt-deacon-boot" won't match when checking for "gt-deacon").
+// HasSession checks if an agent target exists.
+// It first checks exact tmux session existence, then falls back to legacy
+// Gas Town session-name mapping (e.g., "hq-mayor" -> "hq:mayor") in
+// window-per-rig mode.
 func (t *Tmux) HasSession(name string) (bool, error) {
-	_, err := t.run("has-session", "-t", "="+name)
-	if err != nil {
-		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
-			return false, nil
-		}
-		return false, err
+	// Exact session first (preserves generic tmux behavior).
+	has, err := t.hasSessionExact(name)
+	if err != nil || has {
+		return has, err
 	}
-	return true, nil
+
+	// Legacy GT session names (hq-mayor, gt-witness, gt-crew-max, gt-Toast)
+	// map to windows in hq/<rig> sessions in window-per-rig mode.
+	sess, window, ok := legacySessionWindow(name)
+	if !ok {
+		return false, nil
+	}
+	return t.HasWindow(sess, window)
 }
 
 // ListSessions returns all session names.
@@ -771,9 +886,10 @@ func (t *Tmux) SendKeys(session, keys string) error {
 // The debounceMs parameter controls how long to wait after paste before sending Enter.
 // This prevents race conditions where Enter arrives before paste is processed.
 func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr error) {
-	defer func() { telemetry.RecordPromptSend(context.Background(), session, keys, debounceMs, retErr) }()
+	target := t.normalizeTarget(session)
+	defer func() { telemetry.RecordPromptSend(context.Background(), target, keys, debounceMs, retErr) }()
 	// Send text using literal mode (-l) to handle special chars
-	if _, err := t.run("send-keys", "-t", session, "-l", keys); err != nil {
+	if _, err := t.run("send-keys", "-t", target, "-l", keys); err != nil {
 		return err
 	}
 	// Wait for paste to be processed
@@ -781,13 +897,14 @@ func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr e
 		time.Sleep(time.Duration(debounceMs) * time.Millisecond)
 	}
 	// Send Enter separately - more reliable than appending to send-keys
-	_, retErr = t.run("send-keys", "-t", session, "Enter")
+	_, retErr = t.run("send-keys", "-t", target, "Enter")
 	return retErr
 }
 
 // SendKeysRaw sends keystrokes without adding Enter.
 func (t *Tmux) SendKeysRaw(session, keys string) error {
-	_, err := t.run("send-keys", "-t", session, keys)
+	target := t.normalizeTarget(session)
+	_, err := t.run("send-keys", "-t", target, keys)
 	return err
 }
 
@@ -796,8 +913,9 @@ func (t *Tmux) SendKeysRaw(session, keys string) error {
 // Uses Ctrl-U to clear the input line before sending the new message.
 // The delay parameter controls how long to wait after clearing before sending (ms).
 func (t *Tmux) SendKeysReplace(session, keys string, clearDelayMs int) error {
+	target := t.normalizeTarget(session)
 	// Send Ctrl-U to clear any pending input on the line
-	if _, err := t.run("send-keys", "-t", session, "C-u"); err != nil {
+	if _, err := t.run("send-keys", "-t", target, "C-u"); err != nil {
 		return err
 	}
 
@@ -807,7 +925,7 @@ func (t *Tmux) SendKeysReplace(session, keys string, clearDelayMs int) error {
 	}
 
 	// Now send the actual message
-	return t.SendKeys(session, keys)
+	return t.SendKeys(target, keys)
 }
 
 // SendKeysDelayed sends keystrokes after a delay (in milliseconds).
@@ -862,6 +980,7 @@ func releaseNudgeLock(session string) {
 
 // IsSessionAttached returns true if the session has any clients attached.
 func (t *Tmux) IsSessionAttached(target string) bool {
+	target = t.normalizeTarget(target)
 	attached, err := t.run("display-message", "-t", target, "-p", "#{session_attached}")
 	return err == nil && attached == "1"
 }
@@ -876,6 +995,7 @@ func (t *Tmux) IsSessionAttached(target string) bool {
 // Note: This always performs the resize. Use WakePaneIfDetached to skip
 // attached sessions where the wake is unnecessary.
 func (t *Tmux) WakePane(target string) {
+	target = t.normalizeTarget(target)
 	// Resize pane down by 1 row, then up by 1 row
 	// This triggers SIGWINCH without changing the final pane size
 	_, _ = t.run("resize-pane", "-t", target, "-y", "-1")
@@ -965,17 +1085,19 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 // queue up and execute one at a time. This prevents garbled input when
 // SessionStart hooks and nudges arrive simultaneously.
 func (t *Tmux) NudgeSession(session, message string) error {
+	normalized := t.normalizeTarget(session)
+
 	// Serialize nudges to this session to prevent interleaving.
 	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
-	if !acquireNudgeLock(session, nudgeLockTimeout) {
-		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", session)
+	if !acquireNudgeLock(normalized, nudgeLockTimeout) {
+		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", normalized)
 	}
-	defer releaseNudgeLock(session)
+	defer releaseNudgeLock(normalized)
 
 	// Resolve the correct target: in multi-pane sessions, find the pane
 	// running the agent rather than sending to the focused pane.
-	target := session
-	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
+	target := normalized
+	if agentPane, err := t.FindAgentPane(normalized); err == nil && agentPane != "" {
 		target = agentPane
 	}
 
@@ -1003,7 +1125,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			continue
 		}
 		// 5. Wake the pane to trigger SIGWINCH for detached sessions
-		t.WakePaneIfDetached(session)
+		t.WakePaneIfDetached(target)
 		return nil
 	}
 	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
@@ -1060,11 +1182,13 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // Call this after starting Claude and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts.
 func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
+	target := t.normalizeTarget(session)
+
 	// Wait for the dialog to potentially render
 	time.Sleep(1 * time.Second)
 
 	// Check if the bypass permissions warning is present
-	content, err := t.CapturePane(session, 30)
+	content, err := t.CapturePane(target, 30)
 	if err != nil {
 		return err
 	}
@@ -1076,7 +1200,7 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 	}
 
 	// Press Down to select "Yes, I accept" (option 2)
-	if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+	if _, err := t.run("send-keys", "-t", target, "Down"); err != nil {
 		return err
 	}
 
@@ -1084,7 +1208,7 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 	time.Sleep(200 * time.Millisecond)
 
 	// Press Enter to confirm
-	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+	if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
 		return err
 	}
 
@@ -1095,7 +1219,8 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 // For bare session names: "sess" → "sess:0.0"
 // For session:window targets: "sess:win" → "sess:win.0"
 // For pane IDs (%N): returns as-is.
-func pane0Target(target string) string {
+func (t *Tmux) pane0Target(target string) string {
+	target = t.normalizeTarget(target)
 	if strings.HasPrefix(target, "%") {
 		return target
 	}
@@ -1114,7 +1239,7 @@ func (t *Tmux) GetPaneCommand(target string) (string, error) {
 	// Agent processes always run in pane 0; without explicit targeting,
 	// a user-created split pane (running a shell) could cause health
 	// checks to falsely report the agent as dead.
-	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_current_command}")
+	out, err := t.run("display-message", "-t", t.pane0Target(target), "-p", "#{pane_current_command}")
 	if err != nil {
 		return "", err
 	}
@@ -1136,6 +1261,8 @@ func (t *Tmux) GetPaneCommand(target string) (string, error) {
 // Returns ("", nil) if the session has only one pane (no disambiguation needed),
 // or if no agent pane can be identified (caller should fall back to session targeting).
 func (t *Tmux) FindAgentPane(session string) (string, error) {
+	session = t.normalizeTarget(session)
+
 	// List all panes with ID, command, and PID
 	out, err := t.run("list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_pid}")
 	if err != nil {
@@ -1189,7 +1316,7 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 // Returns a pane ID like "%0" that can be used with RespawnPane.
 // target can be a session name or "session:window" format.
 func (t *Tmux) GetPaneID(target string) (string, error) {
-	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_id}")
+	out, err := t.run("display-message", "-t", t.pane0Target(target), "-p", "#{pane_id}")
 	if err != nil {
 		return "", err
 	}
@@ -1203,7 +1330,7 @@ func (t *Tmux) GetPaneID(target string) (string, error) {
 // GetPaneWorkDir returns the current working directory of a pane.
 // target can be a session name or "session:window" format.
 func (t *Tmux) GetPaneWorkDir(target string) (string, error) {
-	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_current_path}")
+	out, err := t.run("display-message", "-t", t.pane0Target(target), "-p", "#{pane_current_path}")
 	if err != nil {
 		return "", err
 	}
@@ -1217,7 +1344,7 @@ func (t *Tmux) GetPaneWorkDir(target string) (string, error) {
 // GetPanePID returns the PID of the pane's main process.
 // target can be a session name, "session:window", or pane ID ("%N").
 func (t *Tmux) GetPanePID(target string) (string, error) {
-	out, err := t.run("display-message", "-t", pane0Target(target), "-p", "#{pane_pid}")
+	out, err := t.run("display-message", "-t", t.pane0Target(target), "-p", "#{pane_pid}")
 	if err != nil {
 		return "", err
 	}
@@ -1231,6 +1358,11 @@ func (t *Tmux) GetPanePID(target string) (string, error) {
 // GetSessionActivity returns the last activity time for a session.
 // This is updated whenever there's any activity in the session (input/output).
 func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
+	session = t.normalizeTarget(session)
+	if i := strings.IndexByte(session, ':'); i >= 0 {
+		session = session[:i]
+	}
+
 	out, err := t.run("display-message", "-t", session, "-p", "#{session_activity}")
 	if err != nil {
 		return time.Time{}, err
@@ -1425,6 +1557,7 @@ func (t *Tmux) FindSessionByWorkDir(targetDir string, processNames []string) ([]
 
 // CapturePane captures the visible content of a pane.
 func (t *Tmux) CapturePane(session string, lines int) (string, error) {
+	session = t.normalizeTarget(session)
 	content, err := t.run("capture-pane", "-p", "-t", session, "-S", fmt.Sprintf("-%d", lines))
 	telemetry.RecordPaneRead(context.Background(), session, lines, len(content), err)
 	return content, err
@@ -1432,6 +1565,7 @@ func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 
 // CapturePaneAll captures all scrollback history.
 func (t *Tmux) CapturePaneAll(session string) (string, error) {
+	session = t.normalizeTarget(session)
 	return t.run("capture-pane", "-p", "-t", session, "-S", "-")
 }
 
@@ -1450,6 +1584,7 @@ func (t *Tmux) CapturePaneLines(session string, lines int) ([]string, error) {
 // AttachSession attaches to an existing session.
 // Note: This replaces the current process with tmux attach.
 func (t *Tmux) AttachSession(session string) error {
+	session = t.normalizeTarget(session)
 	_, err := t.run("attach-session", "-t", session)
 	return err
 }
@@ -1462,13 +1597,38 @@ func (t *Tmux) SelectWindow(session string, index int) error {
 
 // SetEnvironment sets an environment variable in the session.
 func (t *Tmux) SetEnvironment(session, key, value string) error {
-	_, err := t.run("set-environment", "-t", session, key, value)
+	target := t.normalizeTarget(session)
+	if strings.Contains(target, ":") && !strings.HasPrefix(target, "%") {
+		return t.SetWindowOption(target, key, value)
+	}
+	_, err := t.run("set-environment", "-t", target, key, value)
 	return err
 }
 
 // GetEnvironment gets an environment variable from the session.
 func (t *Tmux) GetEnvironment(session, key string) (string, error) {
-	out, err := t.run("show-environment", "-t", session, key)
+	target := t.normalizeTarget(session)
+	if strings.Contains(target, ":") && !strings.HasPrefix(target, "%") {
+		// Prefer window option in window-per-rig mode.
+		if v, err := t.GetWindowOption(target, key); err == nil {
+			return v, nil
+		}
+		// Fall back to session env for shared vars (e.g., GT_ROOT).
+		sessionName := target
+		if i := strings.IndexByte(target, ':'); i >= 0 {
+			sessionName = target[:i]
+		}
+		out, err := t.run("show-environment", "-t", sessionName, key)
+		if err != nil {
+			return "", err
+		}
+		parts := strings.SplitN(out, "=", 2)
+		if len(parts) != 2 {
+			return "", fmt.Errorf("unexpected environment format for %s: %q", key, out)
+		}
+		return parts[1], nil
+	}
+	out, err := t.run("show-environment", "-t", target, key)
 	if err != nil {
 		return "", err
 	}
@@ -1482,7 +1642,15 @@ func (t *Tmux) GetEnvironment(session, key string) (string, error) {
 
 // GetAllEnvironment returns all environment variables for a session.
 func (t *Tmux) GetAllEnvironment(session string) (map[string]string, error) {
-	out, err := t.run("show-environment", "-t", session)
+	target := t.normalizeTarget(session)
+	if strings.Contains(target, ":") && !strings.HasPrefix(target, "%") {
+		// Window option storage does not support listing all keys. Fall back to
+		// session-level environment table for shared vars.
+		if i := strings.IndexByte(target, ':'); i >= 0 {
+			target = target[:i]
+		}
+	}
+	out, err := t.run("show-environment", "-t", target)
 	if err != nil {
 		return nil, err
 	}
@@ -1633,12 +1801,15 @@ func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 // models. target can be a session name or "session:window" format.
 // target can be a session name or "session:window" format.
 func (t *Tmux) IsAgentAlive(target string) bool {
+	target = t.normalizeTarget(target)
 	return t.IsRuntimeRunning(target, t.resolveTargetProcessNames(target))
 }
 
 // resolveTargetProcessNames returns process names for either session targets
 // or session:window targets. Window options take precedence in window mode.
 func (t *Tmux) resolveTargetProcessNames(target string) []string {
+	target = t.normalizeTarget(target)
+
 	// Window-scoped process names are most specific in window-per-rig mode.
 	if strings.Contains(target, ":") {
 		if names, err := t.GetWindowOption(target, "GT_PROCESS_NAMES"); err == nil && names != "" {
@@ -1669,6 +1840,7 @@ func (t *Tmux) resolveTargetProcessNames(target string) []string {
 // Useful for waiting until a shell has started a new process (e.g., claude).
 // Returns nil when a non-excluded command is detected, or error on timeout.
 func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error {
+	session = t.normalizeTarget(session)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		cmd, err := t.GetPaneCommand(session)
@@ -1695,6 +1867,7 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout 
 // WaitForShellReady polls until the pane is running a shell command.
 // Useful for waiting until a process has exited and returned to shell.
 func (t *Tmux) WaitForShellReady(session string, timeout time.Duration) error {
+	session = t.normalizeTarget(session)
 	shells := constants.SupportedShells
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1752,6 +1925,7 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {
+	session = t.normalizeTarget(session)
 	if rc == nil || rc.Tmux == nil {
 		return nil
 	}
@@ -1815,6 +1989,7 @@ func (t *Tmux) SessionSupportsHooks(session string) bool {
 // Returns nil if the agent becomes idle within the timeout.
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
+	session = t.normalizeTarget(session)
 	promptPrefix := DefaultReadyPromptPrefix
 	if agentName, err := t.GetEnvironment(session, "GT_AGENT"); err == nil && agentName != "" {
 		if preset := config.GetAgentPresetByName(agentName); preset != nil && preset.ReadyPromptPrefix != "" {
@@ -1855,6 +2030,21 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
+	// In window-per-rig mode callers may still pass legacy session names
+	// like hq-mayor / gt-witness; map these to the underlying session.
+	if has, err := t.hasSessionExact(name); err == nil && !has {
+		if sess, window, ok := legacySessionWindow(name); ok {
+			hasWindow, werr := t.HasWindow(sess, window)
+			if werr != nil {
+				return nil, werr
+			}
+			if !hasWindow {
+				return nil, ErrSessionNotFound
+			}
+			name = sess
+		}
+	}
+
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
 	out, err := t.run("list-sessions", "-F", format, "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	if err != nil {
@@ -2076,6 +2266,7 @@ func (t *Tmux) ClearHistory(pane string) error {
 // When off (default), the pane is destroyed when its process exits.
 // This is essential for handoff: set on before killing processes, so respawn-pane works.
 func (t *Tmux) SetRemainOnExit(pane string, on bool) error {
+	pane = t.normalizeTarget(pane)
 	value := "on"
 	if !on {
 		value = "off"
@@ -2087,6 +2278,7 @@ func (t *Tmux) SetRemainOnExit(pane string, on bool) error {
 // SwitchClient switches the current tmux client to a different session.
 // Used after remote recycle to move the user's view to the recycled session.
 func (t *Tmux) SwitchClient(targetSession string) error {
+	targetSession = t.normalizeTarget(targetSession)
 	_, err := t.run("switch-client", "-t", targetSession)
 	return err
 }
@@ -2428,7 +2620,12 @@ func (t *Tmux) SetPaneDiedHook(session, agentID string) error {
 //
 // Requires remain-on-exit to be set first (called automatically by this function).
 func (t *Tmux) SetAutoRespawnHook(session string) error {
-	if err := validateSessionName(session); err != nil {
+	session = t.normalizeTarget(session)
+
+	sessionName := session
+	if i := strings.IndexByte(session, ':'); i >= 0 {
+		sessionName = session[:i]
+	} else if err := validateSessionName(session); err != nil {
 		return err
 	}
 	// First, enable remain-on-exit so the pane stays after process exit
@@ -2446,7 +2643,7 @@ func (t *Tmux) SetAutoRespawnHook(session string) error {
 	hookCmd := fmt.Sprintf(`run-shell "sleep 3 && tmux respawn-pane -k -t '%s' && tmux set-option -t '%s' remain-on-exit on"`, safeSession, safeSession)
 
 	// Set the hook on this specific session
-	_, err := t.run("set-hook", "-t", session, "pane-died", hookCmd)
+	_, err := t.run("set-hook", "-t", sessionName, "pane-died", hookCmd)
 	if err != nil {
 		return fmt.Errorf("setting pane-died hook: %w", err)
 	}

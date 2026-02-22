@@ -321,11 +321,11 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 13. Startup fallback for runtimes without executable hooks.
 	// Non-fatal by design: session startup should not fail if nudge injection fails.
-	_ = runtime.RunStartupFallbackWithDelay(t, target, cfg.Role, runtimeConfig)
+	_ = runtime.RunStartupFallback(t, target, cfg.Role, runtimeConfig)
 
 	// 14. Track PID for defense-in-depth orphan cleanup.
 	if cfg.TrackPID && cfg.TownRoot != "" {
-		_ = TrackSessionPID(cfg.TownRoot, cfg.SessionID, t)
+		_ = TrackSessionPID(cfg.TownRoot, target, t)
 	}
 
 	return &StartResult{RuntimeConfig: runtimeConfig}, nil
