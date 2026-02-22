@@ -729,6 +729,14 @@ func (t *Tmux) IsAvailable() bool {
 // Gas Town session-name mapping (e.g., "hq-mayor" -> "hq:mayor") in
 // window-per-rig mode.
 func (t *Tmux) HasSession(name string) (bool, error) {
+	// Accept session:window targets for compatibility with mixed call sites.
+	if strings.Contains(name, ":") && !strings.HasPrefix(name, "%") {
+		parts := strings.SplitN(name, ":", 2)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			return t.HasWindow(parts[0], parts[1])
+		}
+	}
+
 	// Exact session first (preserves generic tmux behavior).
 	has, err := t.hasSessionExact(name)
 	if err != nil || has {
