@@ -586,6 +586,29 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 			rigBeadID := beads.RigBeadIDWithPrefix(newRig.Config.Prefix, name)
 			fmt.Printf("  Created rig identity bead: %s\n", rigBeadID)
 		}
+
+		// Create agent beads for the rig (witness, refinery)
+		// This ensures they exist before the daemon tries to start them
+		prefix := newRig.Config.Prefix
+		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
+		if _, err := bd.CreateAgentBead(witnessID,
+			fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
+			&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
+		); err != nil {
+			fmt.Printf("  %s Could not create witness agent bead: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  Created agent bead: %s\n", witnessID)
+		}
+
+		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
+		if _, err := bd.CreateAgentBead(refineryID,
+			fmt.Sprintf("Refinery for %s - processes merge queue.", name),
+			&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
+		); err != nil {
+			fmt.Printf("  %s Could not create refinery agent bead: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  Created agent bead: %s\n", refineryID)
+		}
 	}
 
 	// Sync hooks for the new rig's targets
@@ -1116,6 +1139,59 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			fmt.Printf("  %s Could not init beads database: %v\n", style.Warning.Render("!"), err)
 		} else {
 			fmt.Printf("  %s Initialized beads database\n", style.Success.Render("✓"))
+		}
+	}
+
+	// Create rig identity bead if prefix is set
+	if result.BeadsPrefix != "" {
+		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
+		beadsWorkDir := rigPath
+		if _, err := os.Stat(mayorRigBeads); err == nil {
+			beadsWorkDir = filepath.Join(rigPath, "mayor", "rig")
+		}
+
+		bd := beads.New(beadsWorkDir)
+		rigBeadID := beads.RigBeadIDWithPrefix(result.BeadsPrefix, name)
+
+		// Check if bead already exists
+		if _, err := bd.Show(rigBeadID); err != nil {
+			fields := &beads.RigFields{
+				Repo:   result.GitURL,
+				Prefix: result.BeadsPrefix,
+				State:  beads.RigStateActive,
+			}
+			if _, err := bd.CreateRigBead(name, fields); err != nil {
+				fmt.Printf("  %s Could not create rig identity bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created rig identity bead: %s\n", style.Success.Render("✓"), rigBeadID)
+			}
+		}
+
+		// Create agent beads for the rig (witness, refinery)
+		// This ensures they exist before the daemon tries to start them
+		prefix := result.BeadsPrefix
+		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
+		if _, err := bd.Show(witnessID); err != nil {
+			if _, err := bd.CreateAgentBead(witnessID,
+				fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
+				&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
+			); err != nil {
+				fmt.Printf("  %s Could not create witness agent bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), witnessID)
+			}
+		}
+
+		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
+		if _, err := bd.Show(refineryID); err != nil {
+			if _, err := bd.CreateAgentBead(refineryID,
+				fmt.Sprintf("Refinery for %s - processes merge queue.", name),
+				&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
+			); err != nil {
+				fmt.Printf("  %s Could not create refinery agent bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), refineryID)
+			}
 		}
 	}
 
@@ -2044,8 +2120,17 @@ func getRigOperationalState(townRoot, rigName string) (state string, source stri
 
 	// Try to find the rig identity bead
 	// Convention: <prefix>-rig-<rigName>
+	// Try to get prefix from rig config.json, fall back to rigs.json registry
+	var prefix string
 	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
-		rigBeadID := fmt.Sprintf("%s-rig-%s", rigCfg.Beads.Prefix, rigName)
+		prefix = rigCfg.Beads.Prefix
+	} else {
+		// Fall back to registry (mayor/rigs.json) when config.json is missing
+		prefix = config.GetRigPrefix(townRoot, rigName)
+	}
+
+	if prefix != "" {
+		rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 		if issue, err := bd.Show(rigBeadID); err == nil {
 			for _, label := range issue.Labels {
 				if strings.HasPrefix(label, "status:") {
