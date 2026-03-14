@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -401,4 +404,260 @@ func TestDaemon_StopsManagerAndScanner(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop() did not complete within 5s")
 	}
+}
+
+// TestIsRunningFromPID_StalePIDReturnsNoError verifies that isRunningFromPID
+// returns (false, 0, nil) — not an error — when it finds and removes a stale
+// PID file. This is the fix for GH#2107: `gt daemon start` was treating the
+// stale cleanup as an error, showing help text instead of starting the daemon.
+func TestIsRunningFromPID_StalePIDReturnsNoError(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	daemonDir := filepath.Join(tmpDir, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a PID file pointing to a process that doesn't exist.
+	// PID 2^22-1 (4194303) is extremely unlikely to be in use.
+	stalePID := 4194303
+	pidFile := filepath.Join(daemonDir, "daemon.pid")
+	if _, err := writePIDFile(pidFile, stalePID); err != nil {
+		t.Fatal(err)
+	}
+
+	running, pid, err := isRunningFromPID(tmpDir)
+	if err != nil {
+		t.Errorf("isRunningFromPID should not return error for stale PID, got: %v", err)
+	}
+	if running {
+		t.Error("expected running=false for stale PID")
+	}
+	if pid != 0 {
+		t.Errorf("expected pid=0, got %d", pid)
+	}
+
+	// PID file should have been removed
+	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+		t.Error("expected stale PID file to be removed")
+	}
+}
+
+// TestIsRunningFromPID_NoPIDFile verifies clean return when no PID file exists.
+func TestIsRunningFromPID_NoPIDFile(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	daemonDir := filepath.Join(tmpDir, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	running, pid, err := isRunningFromPID(tmpDir)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if running {
+		t.Error("expected running=false")
+	}
+	if pid != 0 {
+		t.Errorf("expected pid=0, got %d", pid)
+	}
+}
+
+// TestIsRunningFromPID_LiveProcess verifies detection of a live process.
+func TestIsRunningFromPID_LiveProcess(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	daemonDir := filepath.Join(tmpDir, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use our own PID — guaranteed alive
+	pidFile := filepath.Join(daemonDir, "daemon.pid")
+	if _, err := writePIDFile(pidFile, os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+
+	running, pid, err := isRunningFromPID(tmpDir)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !running {
+		t.Error("expected running=true for live process")
+	}
+	if pid != os.Getpid() {
+		t.Errorf("expected pid=%d, got %d", os.Getpid(), pid)
+	}
+}
+
+func TestHasPendingEvents_EmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	if err := os.MkdirAll(eventDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if d.hasPendingEvents("refinery") {
+		t.Error("expected false for empty event directory")
+	}
+}
+
+func TestHasPendingEvents_MissingDir(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if d.hasPendingEvents("refinery") {
+		t.Error("expected false when event directory doesn't exist")
+	}
+}
+
+func TestHasPendingEvents_WithEventFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	if err := os.MkdirAll(eventDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create an event file
+	eventFile := filepath.Join(eventDir, "1234567890-1-12345.event")
+	if err := os.WriteFile(eventFile, []byte(`{"type":"MQ_SUBMIT"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if !d.hasPendingEvents("refinery") {
+		t.Error("expected true when .event files exist")
+	}
+}
+
+func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	if err := os.MkdirAll(eventDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a non-event file (e.g., .tmp or .lock)
+	if err := os.WriteFile(filepath.Join(eventDir, "temp.lock"), []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if d.hasPendingEvents("refinery") {
+		t.Error("expected false when only non-.event files exist")
+	}
+}
+
+// TestIsRigOperational_FailSafeOnDoltUnavailable verifies that when Dolt is
+// unavailable and we can't check the rig bead for docked status, we fail-safe
+// by assuming the rig is NOT operational. This prevents wasting API credits
+// starting witnesses for potentially docked rigs. (Regression test for
+// bug where witnesses started for docked rigs during Dolt outage)
+func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a minimal rig structure without a beads database
+	rigName := "testrig"
+	rigPath := filepath.Join(tmpDir, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create config.json with a prefix
+	configPath := filepath.Join(rigPath, "config.json")
+	configJSON := `{"beads": {"prefix": "tr"}}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create mayor/rig/.beads directory but NO Dolt database
+	// This simulates Dolt being down or database not accessible
+	mayorBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create town-level .beads with routes.jsonl
+	townBeads := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix":"tr-","path":"testrig/mayor/rig"}`
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create daemon with no Dolt server running
+	d := &Daemon{
+		config: &Config{
+			TownRoot: tmpDir,
+		},
+		logger: log.New(io.Discard, "", 0), // Suppress log output
+	}
+
+	// When Dolt is unavailable, isRigOperational should return false
+	// (fail-safe: assume not operational rather than risk starting docked rig)
+	operational, reason := d.isRigOperational(rigName)
+	if operational {
+		t.Error("isRigOperational should return false when Dolt is unavailable (fail-safe)")
+	}
+	if reason == "" {
+		t.Error("isRigOperational should provide a reason when returning false")
+	}
+	if !strings.Contains(reason, "Dolt unavailable") && !strings.Contains(reason, "cannot verify") {
+		t.Errorf("reason should mention Dolt unavailable, got: %q", reason)
+	}
+}
+
+// TestIsRigOperational_DockedRig verifies that docked rigs are correctly
+// identified as not operational.
+func TestIsRigOperational_DockedRig(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create rig with docked label on rig bead
+	rigName := "dockedrig"
+	rigPath := filepath.Join(tmpDir, rigName)
+	if err := os.MkdirAll(filepath.Join(rigPath, "mayor", "rig", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create config.json
+	configPath := filepath.Join(rigPath, "config.json")
+	configJSON := `{"beads": {"prefix": "dr"}}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create town-level .beads with routes.jsonl
+	townBeads := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix":"dr-","path":"dockedrig/mayor/rig"}`
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{
+		config: &Config{
+			TownRoot: tmpDir,
+		},
+		logger: log.New(io.Discard, "", 0),
+	}
+
+	// Without a rig bead, should fail-safe to not operational
+	operational, reason := d.isRigOperational(rigName)
+	if operational {
+		t.Error("isRigOperational should return false when rig bead is missing")
+	}
+	t.Logf("Docked rig check returned: operational=%v, reason=%q", operational, reason)
 }

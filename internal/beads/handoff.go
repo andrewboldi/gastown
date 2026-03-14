@@ -2,6 +2,7 @@
 package beads
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,13 +11,15 @@ import (
 	"github.com/steveyegge/gastown/internal/lock"
 )
 
-// StatusPinned is the status for pinned beads that never get closed.
-// These are "domain table" beads like role definitions that persist permanently.
-const StatusPinned = "pinned"
+// Issue status constants kept as untyped strings for backward compatibility.
+// The typed versions (IssueStatus) are in status.go.
+const (
+	// StatusPinned is the status for pinned beads that never get closed.
+	StatusPinned = "pinned"
 
-// StatusHooked is the status for beads on an agent's hook (work assignment).
-// This is distinct from pinned - hooked beads are active work, not permanent records.
-const StatusHooked = "hooked"
+	// StatusHooked is the status for beads on an agent's hook (work assignment).
+	StatusHooked = "hooked"
+)
 
 // HandoffBeadTitle returns the well-known title for a role's handoff bead.
 func HandoffBeadTitle(role string) string {
@@ -52,10 +55,9 @@ func (b *Beads) GetOrCreateHandoffBead(role string) (*Issue, error) {
 		return existing, nil
 	}
 
-	// Create new handoff bead (type is deprecated, uses gt:task label via backward compat)
 	issue, err := b.Create(CreateOptions{
 		Title:       HandoffBeadTitle(role),
-		Type:        "task", // Converted to gt:task label by Create()
+		Labels:      []string{"gt:task"},
 		Priority:    2,
 		Description: "", // Empty until first handoff
 		Actor:       role,
@@ -64,13 +66,17 @@ func (b *Beads) GetOrCreateHandoffBead(role string) (*Issue, error) {
 		return nil, fmt.Errorf("creating handoff bead: %w", err)
 	}
 
-	// Update to pinned status
+	// Update to pinned status. If this fails, clean up the orphaned bead
+	// to prevent duplicates on retry (FindHandoffBead only searches pinned beads).
 	status := StatusPinned
 	if err := b.Update(issue.ID, UpdateOptions{Status: &status}); err != nil {
+		// Best-effort cleanup — ignore delete error since pin failure is the real problem
+		_ = b.CloseWithReason("orphaned: failed to pin", issue.ID)
 		return nil, fmt.Errorf("setting handoff bead to pinned: %w", err)
 	}
 
-	// Re-fetch to get updated status
+	// Re-fetch to get updated status. If this fails, the bead is already
+	// created and pinned — a retry of GetOrCreateHandoffBead will find it.
 	return b.Show(issue.ID)
 }
 
@@ -140,13 +146,20 @@ func (b *Beads) ClearMail(reason string) (*ClearMailResult, error) {
 		result.Closed = len(toClose)
 	}
 
-	// Clear pinned messages
+	// Clear pinned messages — continue on error so partial progress isn't lost
 	empty := ""
+	var clearErrs []error
 	for _, issue := range toClear {
 		if err := b.Update(issue.ID, UpdateOptions{Description: &empty}); err != nil {
-			return nil, fmt.Errorf("clearing pinned message %s: %w", issue.ID, err)
+			clearErrs = append(clearErrs, fmt.Errorf("clearing pinned message %s: %w", issue.ID, err))
+			continue
 		}
 		result.Cleared++
+	}
+
+	if len(clearErrs) > 0 {
+		return result, fmt.Errorf("partial failure clearing %d/%d pinned messages: %w",
+			len(clearErrs), len(toClear), errors.Join(clearErrs...))
 	}
 
 	return result, nil

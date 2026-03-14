@@ -2,11 +2,15 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // AgentEnvConfig specifies the configuration for generating agent environment variables.
@@ -69,34 +73,34 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// GT_ROLE is set in compound format (e.g., "beads/crew/jane") so that
 	// beads can parse it without knowing about Gas Town role types.
 	switch cfg.Role {
-	case "mayor":
-		env["GT_ROLE"] = "mayor"
-		env["BD_ACTOR"] = "mayor"
-		env["GIT_AUTHOR_NAME"] = "mayor"
+	case constants.RoleMayor:
+		env["GT_ROLE"] = constants.RoleMayor
+		env["BD_ACTOR"] = constants.RoleMayor
+		env["GIT_AUTHOR_NAME"] = constants.RoleMayor
 
-	case "deacon":
-		env["GT_ROLE"] = "deacon"
-		env["BD_ACTOR"] = "deacon"
-		env["GIT_AUTHOR_NAME"] = "deacon"
+	case constants.RoleDeacon:
+		env["GT_ROLE"] = constants.RoleDeacon
+		env["BD_ACTOR"] = constants.RoleDeacon
+		env["GIT_AUTHOR_NAME"] = constants.RoleDeacon
 
 	case "boot":
 		env["GT_ROLE"] = "deacon/boot"
 		env["BD_ACTOR"] = "deacon-boot"
 		env["GIT_AUTHOR_NAME"] = "boot"
 
-	case "witness":
+	case constants.RoleWitness:
 		env["GT_ROLE"] = fmt.Sprintf("%s/witness", cfg.Rig)
 		env["GT_RIG"] = cfg.Rig
 		env["BD_ACTOR"] = fmt.Sprintf("%s/witness", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/witness", cfg.Rig)
 
-	case "refinery":
+	case constants.RoleRefinery:
 		env["GT_ROLE"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		env["GT_RIG"] = cfg.Rig
 		env["BD_ACTOR"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 
-	case "polecat":
+	case constants.RolePolecat:
 		env["GT_ROLE"] = fmt.Sprintf("%s/polecats/%s", cfg.Rig, cfg.AgentName)
 		env["GT_RIG"] = cfg.Rig
 		env["GT_POLECAT"] = cfg.AgentName
@@ -108,7 +112,7 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		// contention leading to Dolt read-only mode (gt-5cc2p).
 		env["BD_DOLT_AUTO_COMMIT"] = "off"
 
-	case "crew":
+	case constants.RoleCrew:
 		env["GT_ROLE"] = fmt.Sprintf("%s/crew/%s", cfg.Rig, cfg.AgentName)
 		env["GT_RIG"] = cfg.Rig
 		env["GT_CREW"] = cfg.AgentName
@@ -120,7 +124,8 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		// GT_ROLE must be set so startup command resolution can honor role_agents.dog.
 		env["GT_ROLE"] = "dog"
 		if cfg.AgentName != "" {
-			env["BD_ACTOR"] = fmt.Sprintf("dog/%s", cfg.AgentName)
+			env["GT_DOG_NAME"] = cfg.AgentName
+			env["BD_ACTOR"] = fmt.Sprintf("deacon/dogs/%s", cfg.AgentName)
 			env["GIT_AUTHOR_NAME"] = cfg.AgentName
 		} else {
 			env["BD_ACTOR"] = "dog"
@@ -139,7 +144,7 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	}
 
 	// Set BEADS_AGENT_NAME for polecat/crew (uses same format as BD_ACTOR)
-	if cfg.Role == "polecat" || cfg.Role == "crew" {
+	if cfg.Role == constants.RolePolecat || cfg.Role == constants.RoleCrew {
 		env["BEADS_AGENT_NAME"] = fmt.Sprintf("%s/%s", cfg.Rig, cfg.AgentName)
 	}
 
@@ -165,6 +170,16 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	if cfg.Agent != "" {
 		env["GT_AGENT"] = cfg.Agent
 	}
+
+	// Disable bd's per-repo JSONL auto-backup for all Gas Town agents.
+	// bd auto-enables backup when a git remote exists, then force-adds
+	// .beads/backup/ files (bypassing .gitignore) and commits/pushes them
+	// to the project repo. In Gas Town, Dolt is the persistent data store
+	// and the daemon provides centralized backup patrols (dolt_backup,
+	// jsonl_git_backup), making per-repo backup redundant and harmful —
+	// it pollutes rig git history on both main and feature branches.
+	// See: https://github.com/steveyegge/beads/issues/2241
+	env["BD_BACKUP_ENABLED"] = "false"
 
 	// Clear NODE_OPTIONS to prevent debugger flags (e.g., --inspect from VSCode)
 	// from being inherited through tmux into Claude's Node.js runtime.
@@ -250,6 +265,39 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		}
 	}
 
+	// Inject Dolt server port so agents' direct bd invocations connect to
+	// gt's central server instead of auto-starting rogue per-rig servers.
+	// Without this, bd falls back to its own discovery (.beads/dolt-server.port
+	// or auto-start), causing split-brain after reinstall/restart.
+	//
+	// Resolution: config file first, then process env fallback. Process env
+	// propagation ensures agent sessions inherit the port even when TownRoot
+	// is not set (e.g., AgentEnvSimple callers).
+	if cfg.TownRoot != "" {
+		if port := resolveDoltPort(cfg.TownRoot); port > 0 {
+			portStr := strconv.Itoa(port)
+			env["GT_DOLT_PORT"] = portStr
+			env["BEADS_DOLT_PORT"] = portStr
+		}
+	}
+	// Propagate GT_DOLT_PORT / BEADS_DOLT_PORT from process env when not
+	// already resolved from config. This covers sessions where TownRoot is
+	// empty or has no config.yaml (GH#2412).
+	if _, ok := env["GT_DOLT_PORT"]; !ok {
+		if v := os.Getenv("GT_DOLT_PORT"); v != "" {
+			env["GT_DOLT_PORT"] = v
+			// Also set BEADS_DOLT_PORT if not explicitly overridden in env.
+			if os.Getenv("BEADS_DOLT_PORT") == "" {
+				env["BEADS_DOLT_PORT"] = v
+			}
+		}
+	}
+	if _, ok := env["BEADS_DOLT_PORT"]; !ok {
+		if v := os.Getenv("BEADS_DOLT_PORT"); v != "" {
+			env["BEADS_DOLT_PORT"] = v
+		}
+	}
+
 	// Pass through cloud API credentials and provider configuration from the parent shell.
 	// Only variables explicitly listed here are forwarded; all others are blocked for isolation.
 	for _, key := range []string{
@@ -330,6 +378,82 @@ func sanitizeOTELAttrValue(s string, maxLen int) string {
 		s = s[:maxLen]
 	}
 	return s
+}
+
+// resolveDoltPort determines the Dolt server port for the given town root.
+//
+// Resolution order (mirrors doltserver.DefaultConfig without importing it):
+//  1. .dolt-data/config.yaml listener.port (authoritative, machine-generated)
+//  2. GT_DOLT_PORT environment variable
+//  3. mayor/daemon.json env.GT_DOLT_PORT
+//  4. 0 (caller should skip injection — DefaultPort 3307 is bd's own default)
+//
+// This avoids importing doltserver (which pulls in yaml, sql, mysql driver)
+// by scanning the config.yaml line-by-line. The file is machine-generated by
+// gt dolt start with a known format, so a simple line scan is safe.
+func resolveDoltPort(townRoot string) int {
+	// 1. Read from .dolt-data/config.yaml (authoritative)
+	configPath := filepath.Join(townRoot, ".dolt-data", "config.yaml")
+	if data, err := os.ReadFile(configPath); err == nil {
+		if port := parsePortFromConfigYAML(data); port > 0 {
+			return port
+		}
+	}
+
+	// 2. Environment variable
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil && port > 0 {
+			return port
+		}
+	}
+
+	// 3. daemon.json fallback
+	daemonJSONPath := filepath.Join(townRoot, "mayor", "daemon.json")
+	if data, err := os.ReadFile(daemonJSONPath); err == nil {
+		var daemonEnv struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(data, &daemonEnv); err == nil {
+			if v, ok := daemonEnv.Env["GT_DOLT_PORT"]; ok {
+				if port, err := strconv.Atoi(v); err == nil && port > 0 {
+					return port
+				}
+			}
+		}
+	}
+
+	return 0
+}
+
+// parsePortFromConfigYAML extracts the listener port from a Dolt config.yaml
+// without a yaml dependency. The file is machine-generated by gt dolt start
+// with the format:
+//
+//	listener:
+//	  port: 3307
+func parsePortFromConfigYAML(data []byte) int {
+	lines := strings.Split(string(data), "\n")
+	inListener := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "listener:" {
+			inListener = true
+			continue
+		}
+		if inListener {
+			if strings.HasPrefix(trimmed, "port:") {
+				portStr := strings.TrimSpace(strings.TrimPrefix(trimmed, "port:"))
+				if port, err := strconv.Atoi(portStr); err == nil {
+					return port
+				}
+			}
+			// Any non-indented line ends the listener block
+			if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+				inListener = false
+			}
+		}
+	}
+	return 0
 }
 
 // AgentEnvSimple is a convenience function for simple role-based env var lookup.

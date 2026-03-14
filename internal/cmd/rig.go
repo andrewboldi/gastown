@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/deps"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -23,6 +25,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/suggest"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/wisp"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -215,8 +218,9 @@ Examples:
 }
 
 var rigStatusCmd = &cobra.Command{
-	Use:   "status [rig]",
-	Short: "Show detailed status for a specific rig",
+	Use:        "status [rig]",
+	SuggestFor: []string{"health", "health-check", "healthcheck"},
+	Short:      "Show detailed status for a specific rig",
 	Long: `Show detailed status for a specific rig including all workers.
 
 If no rig is specified, infers the rig from the current directory.
@@ -295,9 +299,12 @@ var (
 	rigAddLocalRepo    string
 	rigAddBranch       string
 	rigAddPushURL      string
-	rigAddAdopt        bool
-	rigAddAdoptURL     string
-	rigAddAdoptForce   bool
+	rigAddUpstreamURL  string
+	rigAddAdopt           bool
+	rigAddAdoptURL       string
+	rigAddAdoptForce     bool
+	rigAddFilter         string
+	rigAddSparseCheckout []string
 	rigResetHandoff    bool
 	rigResetMail       bool
 	rigResetStale      bool
@@ -354,9 +361,12 @@ func init() {
 	rigAddCmd.Flags().StringVar(&rigAddLocalRepo, "local-repo", "", "Local repo path to share git objects (optional)")
 	rigAddCmd.Flags().StringVar(&rigAddBranch, "branch", "", "Default branch name (default: auto-detected from remote)")
 	rigAddCmd.Flags().StringVar(&rigAddPushURL, "push-url", "", "Push URL for read-only upstreams (push to fork)")
+	rigAddCmd.Flags().StringVar(&rigAddUpstreamURL, "upstream-url", "", "Upstream repository URL (for fork workflows)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdopt, "adopt", false, "Adopt an existing directory instead of creating new")
 	rigAddCmd.Flags().StringVar(&rigAddAdoptURL, "url", "", "Git remote URL for --adopt (default: auto-detected from origin)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdoptForce, "force", false, "With --adopt, register even if git remote cannot be detected")
+	rigAddCmd.Flags().StringVar(&rigAddFilter, "filter", "", "Partial clone filter (e.g. \"blob:none\", \"tree:0\") to reduce clone size")
+	rigAddCmd.Flags().StringSliceVar(&rigAddSparseCheckout, "sparse-checkout", nil, "Sparse checkout paths (cone mode); comma-separated or repeated")
 
 	rigResetCmd.Flags().BoolVar(&rigResetHandoff, "handoff", false, "Clear handoff content")
 	rigResetCmd.Flags().BoolVar(&rigResetMail, "mail", false, "Clear stale mail messages")
@@ -479,7 +489,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	gitURL := args[1]
 
 	if !isGitRemoteURL(gitURL) {
-		return fmt.Errorf("invalid git URL %q: expected a remote URL (https://, git@, ssh://, git://)\n\nTo register a local directory, use:\n  gt rig add %s --adopt", gitURL, name)
+		return fmt.Errorf("invalid git URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)\n\nTo register a local directory, use:\n  gt rig add %s --adopt", gitURL, name)
 	}
 
 	// Ensure beads (bd) is available before proceeding
@@ -517,19 +527,47 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	// Validate push URL if provided
 	rigAddPushURL = strings.TrimSpace(rigAddPushURL)
 	if rigAddPushURL != "" && !isGitRemoteURL(rigAddPushURL) {
-		return fmt.Errorf("invalid push URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddPushURL)
+		return fmt.Errorf("invalid push URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddPushURL)
+	}
+
+	// Validate upstream URL if provided
+	rigAddUpstreamURL = strings.TrimSpace(rigAddUpstreamURL)
+	if rigAddUpstreamURL != "" && !isGitRemoteURL(rigAddUpstreamURL) {
+		return fmt.Errorf("invalid upstream URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddUpstreamURL)
+	}
+
+	// Validate clone filter if provided
+	if rigAddFilter != "" {
+		validFilters := []string{"blob:none", "tree:0"}
+		valid := false
+		for _, f := range validFilters {
+			if rigAddFilter == f {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("invalid --filter %q: supported values are %v", rigAddFilter, validFilters)
+		}
+		fmt.Printf("  Partial clone: --filter=%s\n", rigAddFilter)
+	}
+	if len(rigAddSparseCheckout) > 0 {
+		fmt.Printf("  Sparse checkout: %v\n", rigAddSparseCheckout)
 	}
 
 	startTime := time.Now()
 
 	// Add the rig
 	newRig, err := mgr.AddRig(rig.AddRigOptions{
-		Name:          name,
-		GitURL:        gitURL,
-		PushURL:       rigAddPushURL,
-		BeadsPrefix:   rigAddPrefix,
-		LocalRepo:     rigAddLocalRepo,
-		DefaultBranch: rigAddBranch,
+		Name:           name,
+		GitURL:         gitURL,
+		PushURL:        rigAddPushURL,
+		UpstreamURL:    rigAddUpstreamURL,
+		BeadsPrefix:    rigAddPrefix,
+		LocalRepo:      rigAddLocalRepo,
+		DefaultBranch:  rigAddBranch,
+		CloneFilter:    rigAddFilter,
+		SparseCheckout: rigAddSparseCheckout,
 	})
 	if err != nil {
 		return fmt.Errorf("adding rig: %w", err)
@@ -573,12 +611,45 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 			rigBeadID := beads.RigBeadIDWithPrefix(newRig.Config.Prefix, name)
 			fmt.Printf("  Created rig identity bead: %s\n", rigBeadID)
 		}
+
+		// Create agent beads for the rig (witness, refinery)
+		// This ensures they exist before the daemon tries to start them
+		prefix := newRig.Config.Prefix
+		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
+		if _, err := bd.CreateAgentBead(witnessID,
+			fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
+			&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
+		); err != nil {
+			fmt.Printf("  %s Could not create witness agent bead: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  Created agent bead: %s\n", witnessID)
+		}
+
+		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
+		if _, err := bd.CreateAgentBead(refineryID,
+			fmt.Sprintf("Refinery for %s - processes merge queue.", name),
+			&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
+		); err != nil {
+			fmt.Printf("  %s Could not create refinery agent bead: %v\n", style.Warning.Render("!"), err)
+		} else {
+			fmt.Printf("  Created agent bead: %s\n", refineryID)
+		}
 	}
 
 	// Sync hooks for the new rig's targets
 	if err := syncRigHooks(townRoot, name); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks for new rig: %v\n", err)
 	}
+
+	// Commit town-level config changes (rigs.json, daemon.json, routes.jsonl)
+	// so they aren't reverted by git restore/checkout operations.
+	commitTownConfigChanges(townRoot, name)
+
+	// Refresh tmux cycle bindings on all running sessions so the new rig's
+	// prefix is recognized by C-b n/p. Without this, existing sessions have
+	// a stale grep pattern that doesn't include the new prefix.
+	// See: https://github.com/steveyegge/gastown/issues/2299
+	refreshCycleBindingsOnExistingSessions()
 
 	elapsed := time.Since(startTime)
 
@@ -678,12 +749,13 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
 	type rigInfo struct {
-		Name     string `json:"name"`
-		Status   string `json:"status"`
-		Witness  string `json:"witness"`
-		Refinery string `json:"refinery"`
-		Polecats int    `json:"polecats"`
-		Crew     int    `json:"crew"`
+		Name        string `json:"name"`
+		BeadsPrefix string `json:"beads_prefix"`
+		Status      string `json:"status"`
+		Witness     string `json:"witness"`
+		Refinery    string `json:"refinery"`
+		Polecats    int    `json:"polecats"`
+		Crew        int    `json:"crew"`
 		// sorting fields (not exported to JSON)
 		sortPrio int
 	}
@@ -691,16 +763,18 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	var rigs []rigInfo
 
 	for name := range rigsConfig.Rigs {
+		prefix := session.PrefixFor(name)
+
 		r, err := mgr.GetRig(name)
 		if err != nil {
-			rigs = append(rigs, rigInfo{Name: name, Status: "error", sortPrio: 99})
+			rigs = append(rigs, rigInfo{Name: name, BeadsPrefix: prefix, Status: "error", sortPrio: 99})
 			continue
 		}
 
 		opState, _ := getRigOperationalState(townRoot, name)
 
-		witnessSession := session.WitnessSessionName(session.PrefixFor(name))
-		refinerySession := session.RefinerySessionName(session.PrefixFor(name))
+		witnessSession := session.WitnessSessionName(prefix)
+		refinerySession := session.RefinerySessionName(prefix)
 		witnessRunning, _ := t.HasSession(witnessSession)
 		refineryRunning, _ := t.HasSession(refinerySession)
 
@@ -715,13 +789,14 @@ func runRigList(cmd *cobra.Command, args []string) error {
 
 		summary := r.Summary()
 		rigs = append(rigs, rigInfo{
-			Name:     name,
-			Status:   strings.ToLower(opState),
-			Witness:  witnessStatus,
-			Refinery: refineryStatus,
-			Polecats: summary.PolecatCount,
-			Crew:     summary.CrewCount,
-			sortPrio: rigStatePriority(witnessRunning, refineryRunning, opState),
+			Name:        name,
+			BeadsPrefix: prefix,
+			Status:      strings.ToLower(opState),
+			Witness:     witnessStatus,
+			Refinery:    refineryStatus,
+			Polecats:    summary.PolecatCount,
+			Crew:        summary.CrewCount,
+			sortPrio:    rigStatePriority(witnessRunning, refineryRunning, opState),
 		})
 	}
 
@@ -840,6 +915,23 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := mgr.RemoveRig(name); err != nil {
+		if errors.Is(err, rig.ErrRigNotFound) {
+			rigPath := filepath.Join(townRoot, name)
+			if info, statErr := os.Stat(rigPath); statErr == nil && info.IsDir() {
+				fmt.Printf("%s Rig %q is not registered but directory exists at %s\n\n",
+					style.Warning.Render("!"), name, rigPath)
+				fmt.Printf("This is an inconsistent state. To fix it, either:\n")
+				fmt.Printf("  Adopt the directory:  %s\n",
+					style.Dim.Render(fmt.Sprintf("gt rig add %s --adopt", name)))
+				fmt.Printf("  Delete the directory: %s\n",
+					style.Dim.Render(fmt.Sprintf("rm -rf %s", rigPath)))
+				return fmt.Errorf("rig %q not in registry but directory exists", name)
+			}
+			// Directory doesn't exist either — suggest similar rig names
+			suggestions := suggest.FindSimilar(name, mgr.ListRigNames(), 3)
+			return fmt.Errorf("removing rig: %s",
+				suggest.FormatSuggestion("rig", name, suggestions, ""))
+		}
 		return fmt.Errorf("removing rig: %w", err)
 	}
 
@@ -869,6 +961,22 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// refreshCycleBindingsOnExistingSessions forces a refresh of the tmux C-b n/p
+// cycle bindings on any existing session. This is needed after gt rig add so
+// the new rig's prefix is included in the grep pattern.
+// Non-fatal: failure only means existing sessions need a restart to pick up the
+// new prefix.
+func refreshCycleBindingsOnExistingSessions() {
+	t := tmux.NewTmux()
+	sessions, err := t.ListSessions()
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+	// Refresh bindings using any existing session as context.
+	// SetCycleBindings' stale-pattern check will detect the mismatch and re-bind.
+	_ = t.SetCycleBindings(sessions[0])
+}
+
 func runRigAdopt(_ *cobra.Command, args []string) error {
 	name := args[0]
 
@@ -896,13 +1004,19 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 
 	// Validate --url if provided
 	if rigAddAdoptURL != "" && !isGitRemoteURL(rigAddAdoptURL) {
-		return fmt.Errorf("invalid git URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddAdoptURL)
+		return fmt.Errorf("invalid git URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddAdoptURL)
 	}
 
 	// Validate --push-url if provided
 	rigAddPushURL = strings.TrimSpace(rigAddPushURL)
 	if rigAddPushURL != "" && !isGitRemoteURL(rigAddPushURL) {
-		return fmt.Errorf("invalid push URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddPushURL)
+		return fmt.Errorf("invalid push URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddPushURL)
+	}
+
+	// Validate --upstream-url if provided
+	rigAddUpstreamURL = strings.TrimSpace(rigAddUpstreamURL)
+	if rigAddUpstreamURL != "" && !isGitRemoteURL(rigAddUpstreamURL) {
+		return fmt.Errorf("invalid upstream URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddUpstreamURL)
 	}
 
 	// Register the existing rig
@@ -910,6 +1024,7 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		Name:        name,
 		GitURL:      rigAddAdoptURL,
 		PushURL:     rigAddPushURL,
+		UpstreamURL: rigAddUpstreamURL,
 		BeadsPrefix: rigAddPrefix,
 		Force:       rigAddAdoptForce,
 	})
@@ -942,6 +1057,10 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			fmt.Printf("  %s Could not update routes.jsonl: %v\n", style.Warning.Render("!"), err)
 		}
 	}
+
+	// Commit town-level config changes (rigs.json, daemon.json, routes.jsonl)
+	// so they aren't reverted by git restore/checkout operations.
+	commitTownConfigChanges(townRoot, name)
 
 	// Check for tracked beads and initialize database if missing (Issue #72)
 	rigPath := filepath.Join(townRoot, name)
@@ -1029,6 +1148,11 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			if prefix == "" {
 				break
 			}
+			// Dolt server is required for beads init.
+			if running, _, sErr := doltserver.IsRunning(townRoot); sErr != nil || !running {
+				fmt.Printf("  %s Could not init bd database: Dolt server is not running\n", style.Warning.Render("!"))
+				break
+			}
 			if err := mgr.InitBeads(rigPath, prefix, name); err != nil {
 				fmt.Printf("  %s Could not init bd database: %v\n", style.Warning.Render("!"), err)
 			} else {
@@ -1041,10 +1165,66 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 	// If no existing .beads/ candidate was found, initialize a fresh database
 	// to match the behavior of the normal (non-adopt) gt rig add path.
 	if !foundBeadsCandidate && result.BeadsPrefix != "" {
-		if err := mgr.InitBeads(rigPath, result.BeadsPrefix, name); err != nil {
+		// Dolt server is required for beads init.
+		if running, _, sErr := doltserver.IsRunning(townRoot); sErr != nil || !running {
+			fmt.Printf("  %s Could not init beads database: Dolt server is not running\n", style.Warning.Render("!"))
+		} else if err := mgr.InitBeads(rigPath, result.BeadsPrefix, name); err != nil {
 			fmt.Printf("  %s Could not init beads database: %v\n", style.Warning.Render("!"), err)
 		} else {
 			fmt.Printf("  %s Initialized beads database\n", style.Success.Render("✓"))
+		}
+	}
+
+	// Create rig identity bead if prefix is set
+	if result.BeadsPrefix != "" {
+		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
+		beadsWorkDir := rigPath
+		if _, err := os.Stat(mayorRigBeads); err == nil {
+			beadsWorkDir = filepath.Join(rigPath, "mayor", "rig")
+		}
+
+		bd := beads.New(beadsWorkDir)
+		rigBeadID := beads.RigBeadIDWithPrefix(result.BeadsPrefix, name)
+
+		// Check if bead already exists
+		if _, err := bd.Show(rigBeadID); err != nil {
+			fields := &beads.RigFields{
+				Repo:   result.GitURL,
+				Prefix: result.BeadsPrefix,
+				State:  beads.RigStateActive,
+			}
+			if _, err := bd.CreateRigBead(name, fields); err != nil {
+				fmt.Printf("  %s Could not create rig identity bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created rig identity bead: %s\n", style.Success.Render("✓"), rigBeadID)
+			}
+		}
+
+		// Create agent beads for the rig (witness, refinery)
+		// This ensures they exist before the daemon tries to start them
+		prefix := result.BeadsPrefix
+		witnessID := beads.WitnessBeadIDWithPrefix(prefix, name)
+		if _, err := bd.Show(witnessID); err != nil {
+			if _, err := bd.CreateAgentBead(witnessID,
+				fmt.Sprintf("Witness for %s - monitors polecat health and progress.", name),
+				&beads.AgentFields{RoleType: "witness", Rig: name, AgentState: "idle"},
+			); err != nil {
+				fmt.Printf("  %s Could not create witness agent bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), witnessID)
+			}
+		}
+
+		refineryID := beads.RefineryBeadIDWithPrefix(prefix, name)
+		if _, err := bd.Show(refineryID); err != nil {
+			if _, err := bd.CreateAgentBead(refineryID,
+				fmt.Sprintf("Refinery for %s - processes merge queue.", name),
+				&beads.AgentFields{RoleType: "refinery", Rig: name, AgentState: "idle"},
+			); err != nil {
+				fmt.Printf("  %s Could not create refinery agent bead: %v\n", style.Warning.Render("!"), err)
+			} else {
+				fmt.Printf("  %s Created agent bead: %s\n", style.Success.Render("✓"), refineryID)
+			}
 		}
 	}
 
@@ -1285,6 +1465,11 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("rig '%s' not found", rigName)
 	}
 
+	// Check if rig is parked or docked (uses bead labels + wisp state)
+	if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
+		return fmt.Errorf("rig '%s' is %s - use 'gt rig unpark' or 'gt rig undock' first", rigName, reason)
+	}
+
 	fmt.Printf("Booting rig %s...\n", style.Bold.Render(rigName))
 
 	var started []string
@@ -1367,12 +1552,10 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Check if rig is parked or docked
-		cfg := wisp.NewConfig(townRoot, rigName)
-		status := cfg.GetString("status")
-		if status == "parked" || status == "docked" {
+		// Check if rig is parked or docked (uses bead labels + wisp state)
+		if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
 			fmt.Printf("%s Rig '%s' is %s - skipping (use 'gt rig unpark' or 'gt rig undock' first)\n",
-				style.Warning.Render("⚠"), rigName, status)
+				style.Warning.Render("⚠"), rigName, reason)
 			continue
 		}
 
@@ -1970,8 +2153,17 @@ func getRigOperationalState(townRoot, rigName string) (state string, source stri
 
 	// Try to find the rig identity bead
 	// Convention: <prefix>-rig-<rigName>
+	// Try to get prefix from rig config.json, fall back to rigs.json registry
+	var prefix string
 	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil {
-		rigBeadID := fmt.Sprintf("%s-rig-%s", rigCfg.Beads.Prefix, rigName)
+		prefix = rigCfg.Beads.Prefix
+	} else {
+		// Fall back to registry (mayor/rigs.json) when config.json is missing
+		prefix = config.GetRigPrefix(townRoot, rigName)
+	}
+
+	if prefix != "" {
+		rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 		if issue, err := bd.Show(rigBeadID); err == nil {
 			for _, label := range issue.Labels {
 				if strings.HasPrefix(label, "status:") {
@@ -2034,8 +2226,47 @@ func findRigSessions(t *tmux.Tmux, rigName string) ([]string, error) {
 	return matches, nil
 }
 
-// isGitRemoteURL returns true if s looks like a remote git URL
-// (https, http, ssh, git protocol, or SCP-style) rather than a local path.
+// commitTownConfigChanges commits town-level config files (rigs.json, daemon.json,
+// routes.jsonl) to the town repo after rig add/adopt. Without this commit, changes
+// are silently reverted by any process that does a git restore/checkout.
+func commitTownConfigChanges(townRoot, rigName string) {
+	g := git.NewGit(townRoot)
+
+	// Collect the town-level files that rig add/adopt modifies.
+	files := []string{
+		filepath.Join("mayor", "rigs.json"),
+		filepath.Join("mayor", "daemon.json"),
+		filepath.Join(".beads", "routes.jsonl"),
+	}
+
+	// Only stage files that actually exist (adopt may not touch all of them).
+	var toAdd []string
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(townRoot, f)); err == nil {
+			toAdd = append(toAdd, f)
+		}
+	}
+	if len(toAdd) == 0 {
+		return
+	}
+
+	if err := g.Add(toAdd...); err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: could not stage town config files: %v\n", err)
+		return
+	}
+
+	msg := fmt.Sprintf("chore: register rig %s in town config", rigName)
+	if err := g.Commit(msg); err != nil {
+		// If nothing changed (already committed), git commit returns an error — that's fine.
+		if !strings.Contains(err.Error(), "nothing to commit") {
+			fmt.Fprintf(os.Stderr, "  Warning: could not commit town config files: %v\n", err)
+		}
+	}
+}
+
+// isGitRemoteURL returns true if s looks like a remote git URL rather than a
+// local path. Accepts any scheme:// URL (git delegates to git-remote-<scheme>
+// helpers, e.g. git-remote-s3 for s3:// URLs) as well as SCP-style SSH URLs.
 func isGitRemoteURL(s string) bool {
 	// Reject flag-like strings (defense-in-depth against argument injection)
 	if strings.HasPrefix(s, "-") {
@@ -2061,11 +2292,17 @@ func isGitRemoteURL(s string) bool {
 	if strings.HasPrefix(s, "file://") {
 		return false
 	}
-	// Accept known remote URL schemes
-	if strings.HasPrefix(s, "https://") ||
-		strings.HasPrefix(s, "http://") ||
-		strings.HasPrefix(s, "ssh://") ||
-		strings.HasPrefix(s, "git://") {
+	// Accept any scheme:// URL where scheme is alphanumeric (plus + - .).
+	// This covers https://, ssh://, git://, s3://, codecommit://, etc.
+	// Git invokes git-remote-<scheme> for non-builtin schemes.
+	if idx := strings.Index(s, "://"); idx > 0 {
+		scheme := s[:idx]
+		for _, c := range scheme {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
+				return false
+			}
+		}
 		return true
 	}
 	// Accept SCP-style SSH URLs (user@host:path) where user and host are non-empty

@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -117,7 +118,7 @@ var roleDefCmd = &cobra.Command{
 
 Role configuration is layered:
   1. Built-in defaults (embedded in binary)
-  2. Town-level overrides (~/.gt/roles/<role>.toml)
+  2. Town-level overrides (<town>/roles/<role>.toml)
   3. Rig-level overrides (<rig>/roles/<role>.toml)
 
 Examples:
@@ -208,7 +209,7 @@ func GetRoleWithContext(cwd, townRoot string) (RoleInfo, error) {
 		// If env is incomplete (missing rig/polecat for roles that need them),
 		// fill gaps from cwd detection and mark as incomplete
 		needsRig := parsedRole == RoleWitness || parsedRole == RoleRefinery || parsedRole == RolePolecat || parsedRole == RoleCrew
-		needsPolecat := parsedRole == RolePolecat || parsedRole == RoleCrew
+		needsPolecat := parsedRole == RolePolecat || parsedRole == RoleCrew || parsedRole == RoleDog
 
 		if needsRig && info.Rig == "" && cwdCtx.Rig != "" {
 			info.Rig = cwdCtx.Rig
@@ -276,6 +277,14 @@ func detectRole(cwd, townRoot string) RoleInfo {
 		return ctx
 	}
 
+	// Check for dog role: deacon/dogs/<name>/
+	// Must check before deacon since dogs are under deacon directory
+	if len(parts) >= 3 && parts[0] == "deacon" && parts[1] == "dogs" {
+		ctx.Role = RoleDog
+		ctx.Polecat = parts[2] // dog name stored in Polecat field
+		return ctx
+	}
+
 	// Check for deacon role: deacon/
 	if len(parts) >= 1 && parts[0] == "deacon" {
 		ctx.Role = RoleDeacon
@@ -329,14 +338,22 @@ func detectRole(cwd, townRoot string) RoleInfo {
 func parseRoleString(s string) (Role, string, string) {
 	s = strings.TrimSpace(s)
 
+	// Normalize consecutive slashes (e.g. "gamestore//refinery" → "gamestore/refinery")
+	for strings.Contains(s, "//") {
+		s = strings.ReplaceAll(s, "//", "/")
+	}
+	s = strings.TrimSuffix(s, "/")
+
 	// Simple roles
 	switch s {
-	case "mayor":
+	case constants.RoleMayor:
 		return RoleMayor, "", ""
-	case "deacon":
+	case constants.RoleDeacon:
 		return RoleDeacon, "", ""
 	case "boot":
 		return RoleBoot, "", ""
+	case "dog":
+		return RoleDog, "", ""
 	}
 
 	// Compound roles: rig/role or rig/polecats/name or rig/crew/name
@@ -355,16 +372,16 @@ func parseRoleString(s string) (Role, string, string) {
 			return RoleBoot, "", ""
 		}
 		return Role(s), "", ""
-	case "witness":
+	case constants.RoleWitness:
 		return RoleWitness, rig, ""
-	case "refinery":
+	case constants.RoleRefinery:
 		return RoleRefinery, rig, ""
 	case "polecats":
 		if len(parts) >= 3 {
 			return RolePolecat, rig, parts[2]
 		}
 		return RolePolecat, rig, ""
-	case "crew":
+	case constants.RoleCrew:
 		if len(parts) >= 3 {
 			return RoleCrew, rig, parts[2]
 		}
@@ -443,6 +460,11 @@ func getRoleHome(role Role, rig, polecat, townRoot string) string {
 		return filepath.Join(townRoot, rig, "crew", polecat)
 	case RoleBoot:
 		return filepath.Join(townRoot, "deacon", "dogs", "boot")
+	case RoleDog:
+		if polecat == "" {
+			return ""
+		}
+		return filepath.Join(townRoot, "deacon", "dogs", polecat)
 	default:
 		return ""
 	}
@@ -723,6 +745,9 @@ func runRoleDef(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  consecutive_failures = %d\n", def.Health.ConsecutiveFailures)
 	fmt.Printf("  kill_cooldown        = %q\n", def.Health.KillCooldown.String())
 	fmt.Printf("  stuck_threshold      = %q\n", def.Health.StuckThreshold.String())
+	if def.Health.HungSessionThreshold.Duration != 0 {
+		fmt.Printf("  hung_session_threshold = %q\n", def.Health.HungSessionThreshold.String())
+	}
 	fmt.Println()
 
 	// Prompts

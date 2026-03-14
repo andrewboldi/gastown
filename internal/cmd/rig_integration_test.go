@@ -43,8 +43,9 @@ var agentAllowlist = map[string][]string{
 	// Mayor is a clone (not worktree) - it's the canonical copy of the user's repo.
 	// For tracked beads repos, bd init creates files here (runs in mayor/rig).
 	"mayor": {
-		"?? AGENTS.md", // bd init: creates multi-provider instructions (tracked beads repos only)
-		"?? .claude/",  // bd init: creates .claude/settings.json with onboard prompt
+		"?? AGENTS.md",  // bd init: creates multi-provider instructions (tracked beads repos only)
+		"?? .claude/",   // bd init: creates .claude/settings.json with onboard prompt
+		"?? .gitignore", // EnsureGitignorePatterns: adds .claude/, .runtime/, .logs/, __pycache__/ patterns
 	},
 
 	// Refinery is a worktree for the merge queue processor.
@@ -53,12 +54,12 @@ var agentAllowlist = map[string][]string{
 	// Crew workers are user-managed worktrees for human developers.
 	"crew": {
 		"?? state.json", // crew/manager.go: Gas Town metadata (TODO: migrate to beads like polecats)
-		"?? .gitignore", // EnsureGitignorePatterns: adds .claude/commands/, .runtime/, and .logs/ patterns
+		"?? .gitignore", // EnsureGitignorePatterns: adds .claude/, .runtime/, .logs/, __pycache__/ patterns
 	},
 
 	// Polecats are ephemeral worktrees for autonomous agents.
 	"polecat": {
-		"?? .gitignore", // EnsureGitignorePatterns: adds .claude/commands/, .runtime/, and .logs/ patterns
+		"?? .gitignore", // EnsureGitignorePatterns: adds .claude/, .runtime/, .logs/, __pycache__/ patterns
 	},
 }
 
@@ -176,6 +177,13 @@ func setupTestTown(t *testing.T) string {
 	beadsDir := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	// Create .dolt-data directory so doltserver.InitRig doesn't consider
+	// a running server "orphaned" (data dir missing) and kill it.
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatalf("mkdir .dolt-data: %v", err)
 	}
 
 	return townRoot
@@ -330,8 +338,10 @@ esac
 // TestRigAddCreatesCorrectStructure verifies that gt rig add creates
 // the expected directory structure.
 func TestRigAddCreatesCorrectStructure(t *testing.T) {
+	requireDoltServer(t)
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "testproject")
 
 	// Load rigs config
@@ -451,7 +461,9 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 		desc string
 	}{
 		{filepath.Join(rigPath, "witness", "rig", ".claude", "settings.local.json"), "witness/rig/.claude/settings.local.json (stale filename)"},
+		{filepath.Join(rigPath, "refinery", "rig", ".claude", "settings.local.json"), "refinery/rig/.claude/settings.local.json (stale filename)"},
 		{filepath.Join(rigPath, "witness", "rig", ".claude", "settings.json"), "witness/rig/.claude/settings.json (settings belong at parent dir)"},
+		{filepath.Join(rigPath, "refinery", "rig", ".claude", "settings.json"), "refinery/rig/.claude/settings.json (settings belong at parent dir)"},
 	}
 
 	for _, w := range staleSettingsThatShouldNotExist {
@@ -489,8 +501,10 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 // TestRigAddInitializesBeads verifies that beads is initialized with
 // the correct prefix.
 func TestRigAddInitializesBeads(t *testing.T) {
+	requireDoltServer(t)
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "beadstest")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -546,18 +560,20 @@ func TestRigAddInitializesBeads(t *testing.T) {
 		t.Errorf("routes.jsonl should NOT exist in rig .beads directory (breaks bd walk-up routing)")
 	}
 
-	// Verify issues.jsonl exists (bd expects this for git-tracked issue data).
+	// Verify issues.jsonl does NOT exist — Dolt is the only backend.
 	rigIssuesPath := filepath.Join(beadsDir, "issues.jsonl")
-	if _, err := os.Stat(rigIssuesPath); err != nil {
-		t.Errorf("issues.jsonl should exist in rig .beads directory: %v", err)
+	if _, err := os.Stat(rigIssuesPath); err == nil {
+		t.Errorf("issues.jsonl should NOT exist in rig .beads directory (Dolt-only mode)")
 	}
 }
 
 // TestRigAddUpdatesRoutes verifies that routes.jsonl is updated
 // with the new rig's route.
 func TestRigAddUpdatesRoutes(t *testing.T) {
+	requireDoltServer(t)
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "routetest")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -625,8 +641,10 @@ func TestRigAddUpdatesRoutes(t *testing.T) {
 // TestRigAddUpdatesRigsJson verifies that rigs.json is updated
 // with the new rig entry.
 func TestRigAddUpdatesRigsJson(t *testing.T) {
+	requireDoltServer(t)
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "jsontest")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -677,8 +695,10 @@ func TestRigAddUpdatesRigsJson(t *testing.T) {
 // TestRigAddDerivesPrefix verifies that when no prefix is specified,
 // one is derived from the rig name.
 func TestRigAddDerivesPrefix(t *testing.T) {
+	requireDoltServer(t)
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "myproject")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -708,8 +728,10 @@ func TestRigAddDerivesPrefix(t *testing.T) {
 // TestRigAddCreatesRigConfig verifies that config.json contains
 // the correct rig configuration.
 func TestRigAddCreatesRigConfig(t *testing.T) {
+	requireDoltServer(t)
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "configtest")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -761,10 +783,98 @@ func TestRigAddCreatesRigConfig(t *testing.T) {
 	}
 }
 
-// TestRigAddCreatesAgentDirs verifies that agent state files are created.
-func TestRigAddCreatesAgentDirs(t *testing.T) {
+// TestRigAddWithUpstreamURL verifies that gt rig add --upstream-url
+// configures the upstream remote on both the bare repo and mayor clone,
+// and persists the URL to config.json and rigs.json.
+func TestRigAddWithUpstreamURL(t *testing.T) {
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
+
+	// Create two repos: one acts as the fork (origin), one as the upstream.
+	forkURL := createTestGitRepo(t, "myfork")
+	upstreamURL := createTestGitRepo(t, "upstream_origin")
+
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsPath)
+	if err != nil {
+		t.Fatalf("load rigs.json: %v", err)
+	}
+
+	g := git.NewGit(townRoot)
+	mgr := rig.NewManager(townRoot, rigsConfig, g)
+
+	_, err = mgr.AddRig(rig.AddRigOptions{
+		Name:        "forkrig",
+		GitURL:      forkURL,
+		UpstreamURL: upstreamURL,
+		BeadsPrefix: "fr",
+	})
+	if err != nil {
+		t.Fatalf("AddRig: %v", err)
+	}
+
+	rigPath := filepath.Join(townRoot, "forkrig")
+
+	t.Run("bare repo has upstream remote", func(t *testing.T) {
+		bareGit := git.NewGitWithDir(filepath.Join(rigPath, ".repo.git"), "")
+		got, err := bareGit.GetUpstreamURL()
+		if err != nil {
+			t.Fatalf("GetUpstreamURL on bare repo: %v", err)
+		}
+		if got != upstreamURL {
+			t.Errorf("bare repo upstream = %q, want %q", got, upstreamURL)
+		}
+	})
+
+	t.Run("mayor clone has upstream remote", func(t *testing.T) {
+		mayorGit := git.NewGit(filepath.Join(rigPath, "mayor", "rig"))
+		got, err := mayorGit.GetUpstreamURL()
+		if err != nil {
+			t.Fatalf("GetUpstreamURL on mayor: %v", err)
+		}
+		if got != upstreamURL {
+			t.Errorf("mayor upstream = %q, want %q", got, upstreamURL)
+		}
+	})
+
+	t.Run("config.json persists upstream_url", func(t *testing.T) {
+		data, err := os.ReadFile(filepath.Join(rigPath, "config.json"))
+		if err != nil {
+			t.Fatalf("reading config.json: %v", err)
+		}
+		var rigCfg rig.RigConfig
+		if err := json.Unmarshal(data, &rigCfg); err != nil {
+			t.Fatalf("parsing config.json: %v", err)
+		}
+		if rigCfg.UpstreamURL != upstreamURL {
+			t.Errorf("config.json UpstreamURL = %q, want %q", rigCfg.UpstreamURL, upstreamURL)
+		}
+	})
+
+	t.Run("rigs.json persists upstream_url", func(t *testing.T) {
+		if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
+			t.Fatalf("save rigs.json: %v", err)
+		}
+		reloaded, err := config.LoadRigsConfig(rigsPath)
+		if err != nil {
+			t.Fatalf("reload rigs.json: %v", err)
+		}
+		entry, ok := reloaded.Rigs["forkrig"]
+		if !ok {
+			t.Fatal("rig 'forkrig' not found in rigs.json")
+		}
+		if entry.UpstreamURL != upstreamURL {
+			t.Errorf("rigs.json UpstreamURL = %q, want %q", entry.UpstreamURL, upstreamURL)
+		}
+	})
+}
+
+// TestRigAddCreatesAgentDirs verifies that agent state files are created.
+func TestRigAddCreatesAgentDirs(t *testing.T) {
+	requireDoltServer(t)
+	_ = mockBdCommand(t)
+	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "agenttest")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -848,8 +958,10 @@ func TestRigAddRejectsInvalidNames(t *testing.T) {
 // TestRigAddCreatesAgentBeads verifies that gt rig add creates
 // witness and refinery agent beads via the manager's initAgentBeads.
 func TestRigAddCreatesAgentBeads(t *testing.T) {
+	requireDoltServer(t)
 	bdLogPath := mockBdCommand(t)
 	townRoot := setupTestTown(t)
+	bridgeDoltPidToTown(t, townRoot)
 	gitURL := createTestGitRepo(t, "agentbeadtest")
 
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -946,7 +1058,7 @@ func TestAgentBeadIDs(t *testing.T) {
 // - Mayor: mayor/rig/ (clone, created by gt rig add)
 // - Refinery: refinery/rig/ (worktree, created by gt rig add)
 // - Crew: crew/<name>/ (worktree, created by gt crew add)
-// - Polecat: polecats/<name>/<rigname>/ (worktree, created by gt polecat add)
+// - Polecat: polecats/<name>/<rigname>/ (worktree, created by gt polecat identity add)
 //
 // Known issues this test catches:
 // - Extra files in .beads/ beyond redirect (e.g., PRIME.md, databases)
@@ -981,10 +1093,10 @@ func TestAgentWorktreesStayClean(t *testing.T) {
 
 // agentWorktree describes an agent's worktree to check for cleanliness.
 type agentWorktree struct {
-	name        string   // Human-readable name (e.g., "mayor", "polecat")
-	path        string   // Path to the worktree
-	allowlist   []string // Additional allowlisted files beyond .beads/redirect
-	isClone     bool     // True if this is a clone (not worktree) - has different expectations
+	name      string   // Human-readable name (e.g., "mayor", "polecat")
+	path      string   // Path to the worktree
+	allowlist []string // Additional allowlisted files beyond .beads/redirect
+	isClone   bool     // True if this is a clone (not worktree) - has different expectations
 }
 
 // runAgentCleanTest runs the agent worktree cleanliness test for all agent types.
@@ -1064,6 +1176,9 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 	}
 	t.Logf("gt install output:\n%s", output)
 
+	// Bridge the test Dolt server PID so AddRig's IsRunning check passes.
+	bridgeDoltPidToTown(t, hqPath)
+
 	// Step 3: Add rig using Manager API (CLI rejects local paths since URL validation was added)
 	// Use different prefix based on whether source has tracked beads
 	prefix := "tr"
@@ -1120,10 +1235,10 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 	cmd.Env = append(os.Environ(), "HOME="+tmpDir, "GT_ROOT="+hqPath)
 	output, err = cmd.CombinedOutput()
 	if err != nil {
-		t.Logf("gt polecat add failed (non-fatal, beads may not be available): %v", err)
+		t.Logf("gt polecat identity add failed (non-fatal, beads may not be available): %v", err)
 	} else {
 		polecatCreated = true
-		t.Logf("gt polecat add output:\n%s", output)
+		t.Logf("gt polecat identity add output:\n%s", output)
 	}
 
 	// Step 6: Define all agent worktrees to check
@@ -1214,6 +1329,7 @@ func checkWorktreeClean(t *testing.T, agent agentWorktree, hasTrackedBeads bool)
 		allowlist["?? .beads/interactions.jsonl"] = true   // Interactions log
 		allowlist["?? .beads/issues.jsonl"] = true         // Issues log
 		allowlist["?? .beads/metadata.json"] = true        // Beads metadata
+		allowlist["M .beads/metadata.json"] = true         // Tracked metadata is rewritten to the active Dolt server in tracked-beads mode
 		allowlist["?? .beads/.gt-types-configured"] = true // Custom types sentinel
 		allowlist["?? .beads/.locks/"] = true              // Beads lock files directory
 		allowlist["?? .beads/dolt-access.lock"] = true     // Dolt access lock

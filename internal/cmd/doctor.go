@@ -38,6 +38,7 @@ Workspace checks:
 Town root protection:
   - town-git                 Verify town root is under version control
   - town-root-branch         Verify town root is on main branch (fixable)
+  - foreign-remotes          Detect git remotes from unrelated repos (fixable)
   - pre-checkout-hook        Verify pre-checkout hook prevents branch switches (fixable)
 
 Infrastructure checks:
@@ -52,6 +53,8 @@ Cleanup checks (fixable):
   - orphan-processes         Detect orphaned Claude processes
   - session-name-format      Detect sessions with outdated naming format (fixable)
   - wisp-gc                  Detect and clean abandoned wisps (>1h)
+  - misclassified-wisps      Detect issues that should be wisps (purges to wisps table, fixable)
+  - jsonl-bloat              Detect stale/bloated issues.jsonl vs live database
   - stale-beads-redirect     Detect stale files in .beads directories with redirects
 
 Clone divergence checks:
@@ -81,6 +84,12 @@ Routing checks (fixable):
   - routes-config            Check beads routing configuration
   - prefix-mismatch          Detect rigs.json vs routes.jsonl prefix mismatches (fixable)
   - database-prefix          Detect database vs routes.jsonl prefix mismatches (fixable)
+
+Lifecycle checks (fixable):
+  - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)
+
+Migration checks:
+  - town-claude-md           Check town-root CLAUDE.md matches embedded version (fixable)
 
 Session hook checks:
   - session-hooks            Check settings.json use session-start.sh
@@ -143,12 +152,20 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	d.Register(doctor.NewGlobalStateCheck())
 
-	// Register built-in checks
+	// Infrastructure prerequisites — these must pass before any check that
+	// shells out to bd/dolt or queries the database. Order matters:
+	// 1. gt binary freshness
+	// 2. bd binary exists
+	// 3. dolt binary exists
+	// 4. Dolt server is reachable (everything downstream depends on this)
 	d.Register(doctor.NewStaleBinaryCheck())
 	d.Register(doctor.NewBeadsBinaryCheck())
-	// All database queries go through bd CLI
+	d.Register(doctor.NewDoltBinaryCheck())
+	d.Register(doctor.NewDoltServerReachableCheck())
+
 	d.Register(doctor.NewTownGitCheck())
 	d.Register(doctor.NewTownRootBranchCheck())
+	d.Register(doctor.NewForeignRemoteCheck())
 	d.Register(doctor.NewPreCheckoutHookCheck())
 	// Claude settings must be fixed BEFORE the daemon starts, so sessions
 	// launched by the daemon find correct settings files. If daemon runs first,
@@ -156,15 +173,19 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// start with missing PATH exports. See gt-99u.
 	d.Register(doctor.NewClaudeSettingsCheck())
 	d.Register(doctor.NewDaemonCheck())
+	d.Register(doctor.NewTmuxGlobalEnvCheck())
 	d.Register(doctor.NewBootHealthCheck())
 	d.Register(doctor.NewTownBeadsConfigCheck())
 	d.Register(doctor.NewCustomTypesCheck())
-	d.Register(doctor.NewRoleLabelCheck())
+	d.Register(doctor.NewCustomStatusesCheck())
 	d.Register(doctor.NewFormulaCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
+	d.Register(doctor.NewRigConfigSyncCheck()) // Check all registered rigs have config.json
+	d.Register(doctor.NewStaleDoltPortCheck()) // Check for stale Dolt port files
 	d.Register(doctor.NewPrefixMismatchCheck())
 	d.Register(doctor.NewDatabasePrefixCheck())
+	d.Register(doctor.NewIdleTimeoutCheck()) // Verify dolt.idle-timeout: "0" for all rigs
 	d.Register(doctor.NewRoutesCheck())
 	d.Register(doctor.NewRigRoutesJSONLCheck())
 	d.Register(doctor.NewRoutingModeCheck())
@@ -174,13 +195,16 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewOrphanProcessCheck())
 	d.Register(doctor.NewWispGCCheck())
 	d.Register(doctor.NewCheckMisclassifiedWisps())
+	d.Register(doctor.NewCheckJSONLBloat())
 	d.Register(doctor.NewStaleBeadsRedirectCheck())
 	d.Register(doctor.NewBeadsRedirectTargetCheck())
+	d.Register(doctor.NewStaleRuntimeFilesCheck())
 	d.Register(doctor.NewBranchCheck())
 	d.Register(doctor.NewCloneDivergenceCheck())
 	d.Register(doctor.NewDefaultBranchAllRigsCheck())
 	d.Register(doctor.NewIdentityCollisionCheck())
 	d.Register(doctor.NewLinkedPaneCheck())
+	d.Register(doctor.NewSocketSplitBrainCheck())
 	d.Register(doctor.NewThemeCheck())
 	d.Register(doctor.NewCrashReportCheck())
 	d.Register(doctor.NewEnvVarsCheck())
@@ -190,6 +214,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewPatrolHooksWiredCheck())
 	d.Register(doctor.NewPatrolNotStuckCheck())
 	d.Register(doctor.NewPatrolPluginsAccessibleCheck())
+	d.Register(doctor.NewPatrolPluginDriftCheck())
 	d.Register(doctor.NewAgentBeadsCheck())
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())
@@ -213,6 +238,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// Priming subsystem check
 	d.Register(doctor.NewPrimingCheck())
 
+	// Town-root CLAUDE.md version check (migration check for behavioral norms)
+	d.Register(doctor.NewTownCLAUDEmdCheck())
+
 	// Crew workspace checks
 	d.Register(doctor.NewCrewStateCheck())
 	d.Register(doctor.NewCrewWorktreeCheck())
@@ -220,6 +248,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	// Lifecycle hygiene checks
 	d.Register(doctor.NewLifecycleHygieneCheck())
+	d.Register(doctor.NewLifecycleDefaultsCheck())
 
 	// Hook attachment checks
 	d.Register(doctor.NewHookAttachmentValidCheck())
@@ -230,10 +259,8 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewStaleTaskDispatchCheck())
 	d.Register(doctor.NewHooksSyncCheck())
 
-	// Dolt health checks
-	d.Register(doctor.NewDoltBinaryCheck())
+	// Dolt data health checks (binary + server reachability moved to top as prerequisites)
 	d.Register(doctor.NewDoltMetadataCheck())
-	d.Register(doctor.NewDoltServerReachableCheck())
 	d.Register(doctor.NewDoltOrphanedDatabaseCheck())
 	d.Register(doctor.NewUnregisteredBeadsDirsCheck())
 	d.Register(doctor.NewNullAssigneeCheck())

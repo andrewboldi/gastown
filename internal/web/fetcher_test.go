@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/activity"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 func TestCalculateWorkStatus(t *testing.T) {
@@ -490,7 +493,9 @@ func TestRunCmd_SuccessAndTimeout(t *testing.T) {
 		t.Skip("shell-based command test")
 	}
 
-	out, err := runCmd(500*time.Millisecond, "sh", "-c", "printf 'ok'")
+	// Use generous timeout for success case — not testing timeout behavior here.
+	// 500ms was flaky under CI load where process startup can take >1s.
+	out, err := runCmd(30*time.Second, "sh", "-c", "printf 'ok'")
 	if err != nil {
 		t.Fatalf("runCmd success case failed: %v", err)
 	}
@@ -498,7 +503,9 @@ func TestRunCmd_SuccessAndTimeout(t *testing.T) {
 		t.Fatalf("runCmd output = %q, want %q", got, "ok")
 	}
 
-	_, err = runCmd(30*time.Millisecond, "sh", "-c", "sleep 1")
+	// Use "exec sleep" so sleep replaces the shell process — avoids orphan child
+	// holding stdout open. Use 200ms timeout (not 30ms) for stability under load.
+	_, err = runCmd(200*time.Millisecond, "sh", "-c", "exec sleep 10")
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -514,6 +521,8 @@ func TestRunBdCmd_ReturnsStdoutOnNonZeroAndTimeout(t *testing.T) {
 
 	binDir := t.TempDir()
 	bdPath := filepath.Join(binDir, "bd")
+	// Use "exec sleep" so the sleep process replaces the shell — no orphan
+	// child processes that hold stdout open after the parent is killed.
 	script := `#!/bin/sh
 case "$1" in
   warn)
@@ -521,8 +530,7 @@ case "$1" in
     exit 1
     ;;
   sleep)
-    sleep 1
-    exit 0
+    exec sleep 10
     ;;
   *)
     echo "ok"
@@ -534,26 +542,303 @@ esac
 		t.Fatalf("write fake bd: %v", err)
 	}
 
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	// Use bdBin with full path instead of t.Setenv("PATH", ...) to avoid
+	// process-wide PATH mutation that can race under concurrent test suites.
+	// Use generous 30s timeout — this fetcher tests exit-code behavior, not
+	// timeouts. The 2s value was flaky under CI load (process startup alone
+	// can take >1s under heavy contention).
+	f := &LiveConvoyFetcher{cmdTimeout: 30 * time.Second, bdBin: bdPath}
 
-	f := &LiveConvoyFetcher{cmdTimeout: 2 * time.Second}
+	t.Run("non-zero exit with stdout returns output", func(t *testing.T) {
+		stdout, err := f.runBdCmd(t.TempDir(), "warn")
+		if err != nil {
+			t.Fatalf("runBdCmd warn returned error: %v", err)
+		}
+		if got := strings.TrimSpace(stdout.String()); got != "partial output" {
+			t.Fatalf("runBdCmd warn output = %q, want %q", got, "partial output")
+		}
+	})
 
-	// Non-zero exit with stdout should return stdout and nil error.
-	stdout, err := f.runBdCmd(t.TempDir(), "warn")
+	t.Run("timeout returns explicit error", func(t *testing.T) {
+		// Use 200ms timeout (not 20ms) to avoid flakiness from process startup
+		// overhead under system load. The script sleeps for 10s so the timeout
+		// always fires first with wide margin.
+		tf := &LiveConvoyFetcher{cmdTimeout: 200 * time.Millisecond, bdBin: bdPath}
+		_, err := tf.runBdCmd(t.TempDir(), "sleep")
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+		if !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("expected timeout error, got: %v", err)
+		}
+	})
+}
+
+func withMayorFetcherHooks(t *testing.T, sessionEnv func(sessionName, key string) (string, error), runCmdFunc func(time.Duration, string, ...string) (*bytes.Buffer, error)) {
+	t.Helper()
+
+	originalGetEnv := fetcherGetSessionEnv
+	originalRunCmd := fetcherRunCmd
+	t.Cleanup(func() {
+		fetcherGetSessionEnv = originalGetEnv
+		fetcherRunCmd = originalRunCmd
+	})
+	t.Cleanup(config.ResetRegistryForTesting)
+
+	if sessionEnv != nil {
+		fetcherGetSessionEnv = sessionEnv
+	}
+	if runCmdFunc != nil {
+		fetcherRunCmd = runCmdFunc
+	}
+}
+
+func TestResolveMayorRuntime(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionEnv  func(sessionName, key string) (string, error)
+		setup       func(t *testing.T, townRoot string)
+		wantRuntime string
+	}{
+		{
+			name: "uses session agent env",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "codex", nil
+			},
+			wantRuntime: "codex",
+		},
+		{
+			name: "falls back to town settings",
+			sessionEnv: func(string, string) (string, error) {
+				return "", os.ErrNotExist
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				settings := config.NewTownSettings()
+				settings.DefaultAgent = "codex"
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+			},
+			wantRuntime: "codex",
+		},
+		{
+			name: "uses custom role agent alias",
+			sessionEnv: func(string, string) (string, error) {
+				return "", os.ErrNotExist
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				settings := config.NewTownSettings()
+				settings.RoleAgents[constants.RoleMayor] = "claude-sonnet"
+				settings.Agents["claude-sonnet"] = &config.RuntimeConfig{
+					Command: "claude",
+					Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+				}
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+			},
+			wantRuntime: "claude/sonnet",
+		},
+		{
+			name: "uses registry agent from session env",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "mayor-registry", nil
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				registry := &config.AgentRegistry{
+					Version: config.CurrentAgentRegistryVersion,
+					Agents: map[string]*config.AgentPresetInfo{
+						"mayor-registry": {
+							Name:    "mayor-registry",
+							Command: "opencode",
+							Args:    []string{"run", "--model", "gpt-5"},
+						},
+					},
+				}
+				if err := config.SaveAgentRegistry(config.DefaultAgentRegistryPath(townRoot), registry); err != nil {
+					t.Fatalf("SaveAgentRegistry: %v", err)
+				}
+			},
+			wantRuntime: "opencode/gpt-5",
+		},
+		{
+			name: "uses ephemeral tier agent from session env",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "claude-sonnet", nil
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), config.NewTownSettings()); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+				t.Setenv("GT_COST_TIER", "economy")
+			},
+			wantRuntime: "claude/sonnet",
+		},
+		{
+			name: "uses provider only role agent alias",
+			sessionEnv: func(string, string) (string, error) {
+				return "", os.ErrNotExist
+			},
+			setup: func(t *testing.T, townRoot string) {
+				t.Helper()
+				settings := config.NewTownSettings()
+				settings.RoleAgents[constants.RoleMayor] = "mayor-custom"
+				settings.Agents["mayor-custom"] = &config.RuntimeConfig{
+					Provider: "codex",
+				}
+				if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+					t.Fatalf("SaveTownSettings: %v", err)
+				}
+			},
+			wantRuntime: "codex",
+		},
+		{
+			name: "returns unknown alias verbatim when unresolved",
+			sessionEnv: func(sessionName, key string) (string, error) {
+				if sessionName != "hq-mayor" || key != "GT_AGENT" {
+					t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+				}
+				return "mystery-agent", nil
+			},
+			wantRuntime: "mystery-agent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withMayorFetcherHooks(t, tt.sessionEnv, nil)
+
+			townRoot := t.TempDir()
+			if tt.setup != nil {
+				tt.setup(t, townRoot)
+			}
+
+			f := &LiveConvoyFetcher{townRoot: townRoot}
+			if got := f.resolveMayorRuntime("hq-mayor"); got != tt.wantRuntime {
+				t.Fatalf("resolveMayorRuntime() = %q, want %q", got, tt.wantRuntime)
+			}
+		})
+	}
+}
+
+func TestRuntimeLabelFromConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  string
+		args     []string
+		fallback string
+		want     string
+	}{
+		{
+			name:     "claude model flag",
+			command:  "claude",
+			args:     []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+			fallback: "claude-sonnet",
+			want:     "claude/sonnet",
+		},
+		{
+			name:     "short model flag",
+			command:  "opencode",
+			args:     []string{"run", "-m", "gpt-5"},
+			fallback: "custom-opencode",
+			want:     "opencode/gpt-5",
+		},
+		{
+			name:     "cgroup wrap unwraps binary",
+			command:  "cgroup-wrap",
+			args:     []string{"/usr/local/bin/codex", "--dangerously-bypass-approvals-and-sandbox"},
+			fallback: "codex",
+			want:     "codex",
+		},
+		{
+			name:     "empty command falls back to alias",
+			command:  "",
+			args:     nil,
+			fallback: "mystery-agent",
+			want:     "mystery-agent",
+		},
+		{
+			name:     "empty command and fallback defaults to claude",
+			command:  "",
+			args:     nil,
+			fallback: "",
+			want:     "claude",
+		},
+		{
+			name:     "model equals form long flag",
+			command:  "claude",
+			args:     []string{"--dangerously-skip-permissions", "--model=sonnet"},
+			fallback: "claude-sonnet",
+			want:     "claude/sonnet",
+		},
+		{
+			name:     "model equals form short flag",
+			command:  "opencode",
+			args:     []string{"-m=gpt-5"},
+			fallback: "custom",
+			want:     "opencode/gpt-5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runtimeLabelFromConfig(tt.command, tt.args, tt.fallback); got != tt.want {
+				t.Fatalf("runtimeLabelFromConfig(%q, %v, %q) = %q, want %q", tt.command, tt.args, tt.fallback, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetchMayor_UsesResolvedRuntime(t *testing.T) {
+	withMayorFetcherHooks(
+		t,
+		func(sessionName, key string) (string, error) {
+			if sessionName != "hq-mayor" || key != "GT_AGENT" {
+				t.Fatalf("unexpected session env lookup: %s %s", sessionName, key)
+			}
+			return "codex", nil
+		},
+		func(_ time.Duration, name string, args ...string) (*bytes.Buffer, error) {
+			if name != "tmux" {
+				t.Fatalf("unexpected command: %s %v", name, args)
+			}
+			return bytes.NewBufferString("hq-mayor:1731328320\nhq-deacon:1731328300\n"), nil
+		},
+	)
+
+	f := &LiveConvoyFetcher{
+		townRoot:             t.TempDir(),
+		mayorActiveThreshold: 24 * time.Hour,
+		tmuxCmdTimeout:       time.Second,
+	}
+
+	status, err := f.FetchMayor()
 	if err != nil {
-		t.Fatalf("runBdCmd warn returned error: %v", err)
+		t.Fatalf("FetchMayor: %v", err)
 	}
-	if got := strings.TrimSpace(stdout.String()); got != "partial output" {
-		t.Fatalf("runBdCmd warn output = %q, want %q", got, "partial output")
+	if !status.IsAttached {
+		t.Fatal("expected mayor to be attached")
 	}
-
-	// Timeout path should return explicit timeout error.
-	f.cmdTimeout = 20 * time.Millisecond
-	_, err = f.runBdCmd(t.TempDir(), "sleep")
-	if err == nil {
-		t.Fatal("expected timeout error")
+	if status.SessionName != "hq-mayor" {
+		t.Fatalf("SessionName = %q, want %q", status.SessionName, "hq-mayor")
 	}
-	if !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("expected timeout error, got: %v", err)
+	if status.Runtime != "codex" {
+		t.Fatalf("Runtime = %q, want %q", status.Runtime, "codex")
+	}
+	if status.LastActivity == "" {
+		t.Fatal("expected LastActivity to be populated")
 	}
 }

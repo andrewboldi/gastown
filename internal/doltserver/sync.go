@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // SyncOptions controls the behavior of SyncDatabases.
@@ -45,31 +47,40 @@ type SyncResult struct {
 	Remote string
 }
 
-// HasRemote checks whether a Dolt database directory has an "origin" remote configured.
-// Returns the push URL if found, or empty string if no origin remote exists.
-func HasRemote(dbDir string) (string, error) {
+// FindRemote returns the name and URL of the first configured remote in a Dolt database.
+// Returns ("", "", nil) if no remotes are configured.
+func FindRemote(dbDir string) (name, url string, err error) {
 	cmd := exec.Command("dolt", "remote", "-v")
 	cmd.Dir = dbDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("dolt remote -v: %w (%s)", err, strings.TrimSpace(string(output)))
+		return "", "", fmt.Errorf("dolt remote -v: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 
-	// Parse output lines looking for origin remote URL.
+	// Parse output lines looking for any remote URL.
 	// Dolt format: "origin https://doltremoteapi.dolthub.com/org/repo {}"
 	// Git format:  "origin  https://... (push)"
+	// Remote names may be "origin", "github", or any user-defined name.
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "origin") {
+		if line == "" {
 			continue
 		}
 		parts := strings.Fields(line)
 		if len(parts) >= 2 {
-			return parts[1], nil
+			return parts[0], parts[1], nil
 		}
 	}
 
-	return "", nil
+	return "", "", nil
+}
+
+// HasRemote checks whether a Dolt database directory has any remote configured.
+// Returns the push URL if found, or empty string if no remote exists.
+// Deprecated: use FindRemote for both the remote name and URL.
+func HasRemote(dbDir string) (string, error) {
+	_, url, err := FindRemote(dbDir)
+	return url, err
 }
 
 // CommitWorkingSet stages and commits any uncommitted changes in a Dolt database directory.
@@ -99,10 +110,10 @@ func CommitWorkingSet(dbDir string) error {
 	return nil
 }
 
-// PushDatabase pushes a Dolt database directory to origin main.
-// If force is true, uses --force.
-func PushDatabase(dbDir string, force bool) error {
-	args := []string{"push", "origin", "main"}
+// PushDatabase pushes a Dolt database directory to the specified remote's main branch.
+// If force is true, uses --force. Requires the Dolt server to be stopped (CLI mode).
+func PushDatabase(dbDir, remote string, force bool) error {
+	args := []string{"push", remote, "main"}
 	if force {
 		args = append(args, "--force")
 	}
@@ -115,6 +126,103 @@ func PushDatabase(dbDir string, force bool) error {
 	}
 
 	return nil
+}
+
+// validSQLName checks that a database or remote name contains only safe characters
+// (alphanumeric, underscore, hyphen, dot). This is a defense-in-depth measure since
+// these values come from internal sources (filesystem scan, SQL query output), but
+// prevents SQL breakage or injection if a name ever contains backticks or quotes.
+func validSQLName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// PushDatabaseSQL pushes a database to its remote via SQL (CALL DOLT_PUSH) through
+// the running Dolt server. This avoids stopping the server and crashing all agents.
+func PushDatabaseSQL(townRoot, db, remote string, force bool) error {
+	if !validSQLName(db) {
+		return fmt.Errorf("invalid database name %q: must match [a-zA-Z0-9_.-]+", db)
+	}
+	if !validSQLName(remote) {
+		return fmt.Errorf("invalid remote name %q: must match [a-zA-Z0-9_.-]+", remote)
+	}
+
+	// Stage any unstaged changes
+	addQuery := fmt.Sprintf("USE `%s`; CALL DOLT_ADD('-A')", db)
+	if err := serverExecSQL(townRoot, addQuery); err != nil {
+		// Non-fatal — may have nothing to stage
+		errStr := err.Error()
+		if !strings.Contains(errStr, "nothing to commit") && !strings.Contains(errStr, "no changes") {
+			fmt.Fprintf(os.Stderr, "  %s: add (non-fatal): %v\n", db, err)
+		}
+	}
+
+	// Commit working set
+	commitQuery := fmt.Sprintf(
+		"USE `%s`; CALL DOLT_COMMIT('-m', 'gt dolt sync: auto-commit working changes', '--allow-empty', '--author', 'Gas Town Sync <sync@gastown.local>')",
+		db,
+	)
+	if err := serverExecSQL(townRoot, commitQuery); err != nil {
+		errStr := err.Error()
+		if !strings.Contains(errStr, "nothing to commit") && !strings.Contains(errStr, "no changes") {
+			fmt.Fprintf(os.Stderr, "  %s: commit (non-fatal): %v\n", db, err)
+		}
+	}
+
+	// Push via SQL — this works through the running server
+	pushQuery := fmt.Sprintf("USE `%s`; CALL DOLT_PUSH('%s', 'main')", db, remote)
+	if force {
+		pushQuery = fmt.Sprintf("USE `%s`; CALL DOLT_PUSH('--force', '%s', 'main')", db, remote)
+	}
+
+	// Push can be slow for large databases — use a longer timeout
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	cmd := buildDoltSQLCmd(ctx, config, "-q", pushQuery)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("DOLT_PUSH: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+
+	return nil
+}
+
+// FindRemoteSQL returns the name and URL of the first remote for a database
+// via SQL query through the running server.
+func FindRemoteSQL(townRoot, db string) (name, url string, err error) {
+	if !validSQLName(db) {
+		return "", "", fmt.Errorf("invalid database name %q: must match [a-zA-Z0-9_.-]+", db)
+	}
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := fmt.Sprintf("USE `%s`; SELECT name, url FROM dolt_remotes LIMIT 1", db)
+	cmd := buildDoltSQLCmd(ctx, config, "-r", "csv", "-q", query)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", "", fmt.Errorf("querying remotes for %s: %w (%s)", db, err, strings.TrimSpace(string(output)))
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) < 2 {
+		return "", "", nil // no remotes
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(lines[1]), ",", 2)
+	if len(parts) < 2 {
+		return "", "", nil
+	}
+	return parts[0], parts[1], nil
 }
 
 // SyncDatabases iterates all databases (or a filtered subset), checks for remotes,
@@ -139,16 +247,16 @@ func SyncDatabases(townRoot string, opts SyncOptions) []SyncResult {
 		dbDir := RigDatabaseDir(townRoot, db)
 		result := SyncResult{Database: db}
 
-		// Check for remote
-		remote, err := HasRemote(dbDir)
+		// Check for remote (any name — "origin", "github", etc.)
+		remoteName, remoteURL, err := FindRemote(dbDir)
 		if err != nil {
 			result.Error = fmt.Errorf("checking remote: %w", err)
 			results = append(results, result)
 			continue
 		}
-		result.Remote = remote
+		result.Remote = remoteURL
 
-		if remote == "" {
+		if remoteURL == "" {
 			// Auto-setup DoltHub remote if credentials are available.
 			token := DoltHubToken()
 			org := DoltHubOrg()
@@ -160,13 +268,13 @@ func SyncDatabases(townRoot string, opts SyncOptions) []SyncResult {
 					continue
 				}
 				// Remote is now configured; re-read it.
-				remote, err = HasRemote(dbDir)
-				if err != nil || remote == "" {
+				remoteName, remoteURL, err = FindRemote(dbDir)
+				if err != nil || remoteURL == "" {
 					result.Error = fmt.Errorf("remote not found after auto-setup")
 					results = append(results, result)
 					continue
 				}
-				result.Remote = remote
+				result.Remote = remoteURL
 			} else {
 				result.Skipped = true
 				results = append(results, result)
@@ -188,7 +296,82 @@ func SyncDatabases(townRoot string, opts SyncOptions) []SyncResult {
 		}
 
 		// Push
-		if err := PushDatabase(dbDir, opts.Force); err != nil {
+		if err := PushDatabase(dbDir, remoteName, opts.Force); err != nil {
+			result.Error = err
+			results = append(results, result)
+			continue
+		}
+
+		result.Pushed = true
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// SyncDatabasesSQL iterates all databases (or a filtered subset) and pushes via SQL
+// through the running Dolt server. Unlike SyncDatabases, this does NOT require
+// stopping the server, so it won't crash running agents.
+func SyncDatabasesSQL(townRoot string, opts SyncOptions) []SyncResult {
+	databases, err := ListDatabases(townRoot)
+	if err != nil {
+		return []SyncResult{{
+			Database: "(list)",
+			Error:    fmt.Errorf("listing databases: %w", err),
+		}}
+	}
+
+	var results []SyncResult
+
+	for _, db := range databases {
+		if opts.Filter != "" && db != opts.Filter {
+			continue
+		}
+
+		result := SyncResult{Database: db}
+
+		// Check for remote via SQL
+		remoteName, remoteURL, err := FindRemoteSQL(townRoot, db)
+		if err != nil {
+			result.Error = fmt.Errorf("checking remote: %w", err)
+			results = append(results, result)
+			continue
+		}
+		result.Remote = remoteURL
+
+		if remoteURL == "" {
+			// Try auto-setup if credentials are available
+			dbDir := RigDatabaseDir(townRoot, db)
+			token := DoltHubToken()
+			org := DoltHubOrg()
+			if token != "" && org != "" {
+				if err := SetupDoltHubRemote(dbDir, org, db, token); err != nil {
+					result.Error = fmt.Errorf("auto-setup DoltHub remote: %w", err)
+					results = append(results, result)
+					continue
+				}
+				remoteName, remoteURL, err = FindRemoteSQL(townRoot, db)
+				if err != nil || remoteURL == "" {
+					result.Error = fmt.Errorf("remote not found after auto-setup")
+					results = append(results, result)
+					continue
+				}
+				result.Remote = remoteURL
+			} else {
+				result.Skipped = true
+				results = append(results, result)
+				continue
+			}
+		}
+
+		if opts.DryRun {
+			result.DryRun = true
+			results = append(results, result)
+			continue
+		}
+
+		// Push via SQL (server stays running)
+		if err := PushDatabaseSQL(townRoot, db, remoteName, opts.Force); err != nil {
 			result.Error = err
 			results = append(results, result)
 			continue
@@ -236,9 +419,8 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// Build bd purge command with safety-net timeout.
 	// bd purge v2 uses batched SQL (completes in seconds), but we keep a
 	// generous timeout as a circuit breaker against future regressions.
-	// --allow-stale prevents failures when database is temporarily stale,
-	// consistent with all other bd invocations in the codebase.
-	args := []string{"--allow-stale", "purge", "--json"}
+	// Conditionally use --allow-stale if bd supports it.
+	args := beads.MaybePrependAllowStale([]string{"purge", "--json"})
 	if dryRun {
 		args = append(args, "--dry-run")
 	}

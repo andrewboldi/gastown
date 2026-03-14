@@ -7,14 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/gofrs/flock"
 
-	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/telemetry"
 )
 
@@ -40,7 +38,7 @@ func (b *Beads) lockAgentBead(id string) (*flock.Flock, error) {
 type AgentFields struct {
 	RoleType          string // polecat, witness, refinery, deacon, mayor
 	Rig               string // Rig name (empty for global agents like mayor/deacon)
-	AgentState        string // spawning, working, done, stuck
+	AgentState        string // spawning, working, done, stuck, escalated, idle, running, nuked
 	HookBead          string // Currently pinned work bead ID
 	CleanupStatus     string // ZFC: polecat self-reports git state (clean, has_uncommitted, has_stash, has_unpushed)
 	ActiveMR          string // Currently active merge request bead ID (for traceability)
@@ -48,6 +46,15 @@ type AgentFields struct {
 	Mode              string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
 	// Note: RoleBead field removed - role definitions are now config-based.
 	// See internal/config/roles/*.toml and config-based-roles.md.
+
+	// Completion metadata fields (gt-x7t9).
+	// Written by gt done, read by witness survey-workers to discover
+	// completion state from beads instead of POLECAT_DONE mail.
+	ExitType       string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE (see witness.ExitType*)
+	MRID           string // MR bead ID (if MR was created)
+	Branch         string // Polecat working branch name
+	MRFailed       bool   // True when MR creation was attempted but failed
+	CompletionTime string // RFC3339 timestamp of when gt done was called
 }
 
 // Notification level constants
@@ -106,6 +113,23 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 		lines = append(lines, fmt.Sprintf("mode: %s", fields.Mode))
 	}
 
+	// Completion metadata fields (gt-x7t9)
+	if fields.ExitType != "" {
+		lines = append(lines, fmt.Sprintf("exit_type: %s", fields.ExitType))
+	}
+	if fields.MRID != "" {
+		lines = append(lines, fmt.Sprintf("mr_id: %s", fields.MRID))
+	}
+	if fields.Branch != "" {
+		lines = append(lines, fmt.Sprintf("branch: %s", fields.Branch))
+	}
+	if fields.MRFailed {
+		lines = append(lines, "mr_failed: true")
+	}
+	if fields.CompletionTime != "" {
+		lines = append(lines, fmt.Sprintf("completion_time: %s", fields.CompletionTime))
+	}
+
 	return strings.Join(lines, "\n")
 }
 
@@ -139,8 +163,6 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.AgentState = value
 		case "hook_bead":
 			fields.HookBead = value
-		case "role_bead":
-			// Ignored - role definitions are now config-based (backward compat)
 		case "cleanup_status":
 			fields.CleanupStatus = value
 		case "active_mr":
@@ -149,6 +171,17 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.NotificationLevel = value
 		case "mode":
 			fields.Mode = value
+		// Completion metadata fields (gt-x7t9)
+		case "exit_type":
+			fields.ExitType = value
+		case "mr_id":
+			fields.MRID = value
+		case "branch":
+			fields.Branch = value
+		case "mr_failed":
+			fields.MRFailed = value == "true"
+		case "completion_time":
+			fields.CompletionTime = value
 		}
 	}
 
@@ -177,7 +210,7 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 	// This is cached (sentinel file + in-memory) so repeated calls are fast.
 	// On fresh rigs, this may fail if the database can't be initialized.
 	// Don't bail out — try the bd create calls anyway (GH#1769).
-	ensureErr := EnsureCustomTypes(targetDir)
+	_ = EnsureCustomTypes(targetDir)
 
 	description := FormatAgentDescription(title, fields)
 
@@ -188,11 +221,8 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 			"--description=" + description,
 			"--type=agent",
 			"--labels=gt:agent",
+			"--ephemeral",
 		}
-		// Persistent polecats (gt-4ac): agent beads are non-ephemeral (issues table).
-		// They persist across polecat lifecycles and survive Dolt GC.
-		// Previously used --ephemeral (wisps table) but persistent polecats need
-		// durable agent state for idle detection and reuse.
 		if NeedsForceForID(id) {
 			a = append(a, "--force")
 		}
@@ -204,23 +234,15 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 		return a
 	}
 
-	// Create non-ephemeral agent bead (issues table). Persistent polecats (gt-4ac)
-	// need durable agent beads that survive across work assignments.
+	// Create ephemeral agent bead (wisps table). Agent operational state has
+	// zero git history consumers (gt-bewatn.9).
 	out, err := b.run(buildArgs()...)
 	if err != nil {
 		out, err = b.run(buildArgs()...)
 		if err != nil {
-			// Both bd create attempts failed. If EnsureCustomTypes also failed,
-			// the database may be completely uninitialized. Fall back to writing
-			// the agent bead directly as a JSONL entry (GH#1769 workaround).
-			if ensureErr != nil || isSubprocessCrash(err) {
-				issue, jsonlErr := createAgentBeadViaJSONL(targetDir, id, title, description)
-				if jsonlErr != nil {
-					return nil, fmt.Errorf("creating %s: bd create failed (%w), JSONL fallback also failed (%w)", id, err, jsonlErr)
-				}
-				return issue, nil
-			}
-			return nil, err
+			// Both bd create attempts failed. Dolt server is required —
+			// no JSONL fallback. Surface the error directly.
+			return nil, fmt.Errorf("creating %s: bd create failed: %w", id, err)
 		}
 	}
 
@@ -231,68 +253,17 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 
 	// Note: role slot no longer set - role definitions are config-based
 
-	// Set the hook slot if specified (this is the authoritative storage)
-	// This fixes the slot inconsistency bug where bead status is 'hooked' but
-	// agent's hook slot is empty. See mi-619.
-	// Use a target Beads instance with proper BEADS_DIR routing (gt-wrnwq).
+	// Set hook_bead slot so gt mol status can find hooked work via the
+	// agent bead's JSON field (primary lookup path in lookupHookedWork).
+	// The fallback query (status=hooked + assignee) is unreliable for
+	// cross-database scenarios. Restoring per hq-gfg.
 	if fields != nil && fields.HookBead != "" {
-		target := b
-		if targetDir != b.getResolvedBeadsDir() {
-			target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-		}
-		if err := target.SetHookBead(id, fields.HookBead); err != nil {
-			// Non-fatal: warn but continue - description text has the backup
-			style.PrintWarning("could not set hook slot: %v", err)
+		if _, slotErr := b.run("slot", "set", id, "hook", fields.HookBead); slotErr != nil {
+			// Non-fatal: fallback query may still find the work bead
 		}
 	}
 
 	return &issue, nil
-}
-
-// createAgentBeadViaJSONL writes an agent bead directly to the issues.jsonl file
-// as a fallback when all bd create attempts fail (GH#1769). This bypasses the
-// Dolt database entirely and creates a JSONL entry that bd import can pick up.
-// The bead will be properly imported on the next bd init or bd import.
-func createAgentBeadViaJSONL(beadsDir, id, title, description string) (*Issue, error) {
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	issue := &Issue{
-		ID:          id,
-		Title:       title,
-		Description: description,
-		Status:      "open",
-		Type:        "agent",
-		Labels:      []string{"gt:agent"},
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
-
-	data, err := json.Marshal(issue)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling agent bead JSON: %w", err)
-	}
-
-	// Append to JSONL file (create if needed). Use O_APPEND for atomicity.
-	f, err := os.OpenFile(jsonlPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) //nolint:gosec // G304: path is constructed internally
-	if err != nil {
-		return nil, fmt.Errorf("opening %s: %w", jsonlPath, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return nil, fmt.Errorf("writing to %s: %w", jsonlPath, err)
-	}
-
-	// Try to import the JSONL file into the database (best effort).
-	// This may fail if the database is truly uninitialized, but the JSONL
-	// file is now on disk for manual or future import.
-	importCmd := exec.Command("bd", "import", "-i", jsonlPath)
-	importCmd.Dir = filepath.Dir(beadsDir)
-	importCmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
-	_, _ = importCmd.CombinedOutput() // Best effort
-
-	return issue, nil
 }
 
 // CreateOrReopenAgentBead creates an agent bead or reopens an existing one.
@@ -373,26 +344,21 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	if _, err := target.run("update", id, "--type=agent"); err != nil {
 		return nil, fmt.Errorf("fixing agent bead type: %w", err)
 	}
-	// Persistent polecats (gt-4ac): agent beads are non-ephemeral.
-	// Migrate any existing ephemeral (wisp) beads to the issues table
-	// by removing the ephemeral flag. This ensures agent state persists
-	// across polecat lifecycles for idle detection and reuse.
-	if _, err := target.run("update", id, "--no-ephemeral"); err != nil {
-		// Non-fatal: the bead is functional either way
-		// --no-ephemeral may not be supported in all bd versions
+	// Ensure agent bead is ephemeral (wisp) — agent operational state has
+	// zero git history consumers (gt-bewatn.9)
+	if _, err := target.run("update", id, "--ephemeral"); err != nil {
+		// Non-fatal: the bead is functional without ephemeral flag
+		_ = err
 	}
 
 	// Note: role slot no longer set - role definitions are config-based
 
-	// Clear any existing hook slot (handles stale state from previous lifecycle)
-	// Use target Beads instance with proper BEADS_DIR routing (gt-wrnwq).
-	_ = target.ClearHookBead(id)
-
-	// Set the hook slot if specified
+	// Set hook_bead slot so gt mol status can find hooked work via the
+	// agent bead's JSON field (primary lookup path in lookupHookedWork).
+	// Restoring per hq-gfg.
 	if fields != nil && fields.HookBead != "" {
-		if err := target.SetHookBead(id, fields.HookBead); err != nil {
-			// Non-fatal: warn but continue - description text has the backup
-			style.PrintWarning("could not set hook slot: %v", err)
+		if _, slotErr := target.run("slot", "set", id, "hook", fields.HookBead); slotErr != nil {
+			// Non-fatal: fallback query may still find the work bead
 		}
 	}
 
@@ -437,7 +403,13 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	fields.HookBead = ""      // Clear hook_bead
 	fields.ActiveMR = ""      // Clear active_mr
 	fields.CleanupStatus = "" // Clear cleanup_status
-	fields.AgentState = "nuked"
+	fields.AgentState = string(AgentStateNuked)
+	// Clear completion metadata (gt-x7t9)
+	fields.ExitType = ""
+	fields.MRID = ""
+	fields.Branch = ""
+	fields.MRFailed = false
+	fields.CompletionTime = ""
 
 	// Update description with cleared fields
 	description := FormatAgentDescription(issue.Title, fields)
@@ -445,24 +417,15 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 		return fmt.Errorf("resetting agent bead fields: %w", err)
 	}
 
-	// Also clear the hook slot in the database
-	_ = target.ClearHookBead(id)
+	// Hook slot no longer maintained (hq-l6mm5) — no need to clear.
 
 	return nil
 }
 
 // UpdateAgentState updates the agent_state field in an agent bead.
-// Optionally updates hook_bead if provided.
-//
-// IMPORTANT: This function uses the proper bd commands to update agent fields:
-// - `bd agent state` for agent_state (uses the database column directly)
-// - `bd slot set/clear` for hook_bead (uses the database column directly)
-//
-// This ensures consistency with `bd slot show` and other beads commands.
-// Previously, this function embedded these fields in the description text,
-// which caused inconsistencies with bd slot commands (see GH #gt-9v52).
-func (b *Beads) UpdateAgentState(id string, state string, hookBead *string) (retErr error) {
-	defer func() { telemetry.RecordAgentStateChange(context.Background(), id, state, hookBead, retErr) }()
+// Uses `bd agent state` command for the database column directly.
+func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
+	defer func() { telemetry.RecordAgentStateChange(context.Background(), id, state, nil, retErr) }()
 	// Update agent state using bd agent state command
 	// Use runWithRouting so bd can resolve cross-prefix agent beads (e.g., wa-*
 	// agent beads from hq context) via routes.jsonl instead of BEADS_DIR.
@@ -471,70 +434,14 @@ func (b *Beads) UpdateAgentState(id string, state string, hookBead *string) (ret
 		return fmt.Errorf("updating agent state: %w", err)
 	}
 
-	// Update hook_bead if provided
-	// Use runWithRouting for slot ops so bd can resolve cross-prefix beads
-	// (e.g., hq-* hook beads on gt-* agent beads) via routes.jsonl.
-	if hookBead != nil {
-		if *hookBead != "" {
-			// Set the hook using bd slot set
-			_, err = b.runWithRouting("slot", "set", id, "hook", *hookBead)
-			if err != nil {
-				// If slot is already occupied, clear it first then retry
-				// This handles re-slinging scenarios where we're updating the hook
-				errStr := err.Error()
-				if strings.Contains(errStr, "already occupied") {
-					_, _ = b.runWithRouting("slot", "clear", id, "hook")
-					_, err = b.runWithRouting("slot", "set", id, "hook", *hookBead)
-				}
-				if err != nil {
-					return fmt.Errorf("setting hook: %w", err)
-				}
-			}
-		} else {
-			// Clear the hook
-			_, err = b.runWithRouting("slot", "clear", id, "hook")
-			if err != nil {
-				return fmt.Errorf("clearing hook: %w", err)
-			}
-		}
-	}
+	// Hook slot no longer maintained (hq-l6mm5) — removed hook_bead parameter.
 
 	return nil
 }
 
-// SetHookBead sets the hook_bead slot on an agent bead.
-// This is a convenience wrapper that only sets the hook without changing agent_state.
-// Per gt-zecmc: agent_state ("running", "dead", "idle") is observable from tmux
-// and should not be recorded in beads ("discover, don't track" principle).
-func (b *Beads) SetHookBead(agentBeadID, hookBeadID string) error {
-	// Set the hook using bd slot set
-	// Use runWithRouting so bd can resolve cross-prefix beads (e.g., hq-* hook
-	// beads on gt-* agent beads) via routes.jsonl instead of BEADS_DIR.
-	_, err := b.runWithRouting("slot", "set", agentBeadID, "hook", hookBeadID)
-	if err != nil {
-		// If slot is already occupied, clear it first then retry
-		errStr := err.Error()
-		if strings.Contains(errStr, "already occupied") {
-			_, _ = b.runWithRouting("slot", "clear", agentBeadID, "hook")
-			_, err = b.runWithRouting("slot", "set", agentBeadID, "hook", hookBeadID)
-		}
-		if err != nil {
-			return fmt.Errorf("setting hook: %w", err)
-		}
-	}
-	return nil
-}
-
-// ClearHookBead clears the hook_bead slot on an agent bead.
-// Used when work is complete or unslung.
-func (b *Beads) ClearHookBead(agentBeadID string) error {
-	// Use runWithRouting so bd can resolve cross-prefix beads via routes.jsonl.
-	_, err := b.runWithRouting("slot", "clear", agentBeadID, "hook")
-	if err != nil {
-		return fmt.Errorf("clearing hook: %w", err)
-	}
-	return nil
-}
+// SetHookBead and ClearHookBead removed (hq-l6mm5).
+// Hook slot on agent beads is no longer maintained. Work bead status=hooked
+// and assignee=<agent> is the authoritative source for hook tracking.
 
 // AgentFieldUpdates specifies which agent description fields to update.
 // Only non-nil fields are modified; nil fields are left unchanged.
@@ -545,6 +452,12 @@ type AgentFieldUpdates struct {
 	ActiveMR          *string
 	NotificationLevel *string
 	Mode              *string
+	// Completion metadata fields (gt-x7t9)
+	ExitType       *string
+	MRID           *string
+	Branch         *string
+	MRFailed       *bool
+	CompletionTime *string
 }
 
 // UpdateAgentDescriptionFields atomically updates one or more agent description
@@ -588,6 +501,22 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	if updates.Mode != nil {
 		fields.Mode = *updates.Mode
 	}
+	// Completion metadata fields (gt-x7t9)
+	if updates.ExitType != nil {
+		fields.ExitType = *updates.ExitType
+	}
+	if updates.MRID != nil {
+		fields.MRID = *updates.MRID
+	}
+	if updates.Branch != nil {
+		fields.Branch = *updates.Branch
+	}
+	if updates.MRFailed != nil {
+		fields.MRFailed = *updates.MRFailed
+	}
+	if updates.CompletionTime != nil {
+		fields.CompletionTime = *updates.CompletionTime
+	}
 
 	description := FormatAgentDescription(issue.Title, fields)
 	return b.Update(id, UpdateOptions{Description: &description})
@@ -612,6 +541,46 @@ func (b *Beads) UpdateAgentActiveMR(id string, activeMR string) error {
 // Pass empty string to reset to default (normal).
 func (b *Beads) UpdateAgentNotificationLevel(id string, level string) error {
 	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{NotificationLevel: &level})
+}
+
+// CompletionMetadata holds the fields written by gt done to record
+// polecat work completion on the agent bead. The witness survey-workers
+// step reads these fields to discover completion state from beads
+// instead of POLECAT_DONE mail (nudge-over-mail redesign, gt-x7t9).
+type CompletionMetadata struct {
+	ExitType       string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE
+	MRID           string // MR bead ID (empty if no MR)
+	Branch         string // Polecat working branch
+	HookBead       string // The work bead ID
+	MRFailed       bool   // True when MR creation was attempted but failed
+	CompletionTime string // RFC3339 timestamp
+}
+
+// UpdateAgentCompletion atomically writes all completion metadata fields
+// to an agent bead. Called by gt done to record completion state.
+func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error {
+	mrFailed := meta.MRFailed
+	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
+		ExitType:       &meta.ExitType,
+		MRID:           &meta.MRID,
+		Branch:         &meta.Branch,
+		MRFailed:       &mrFailed,
+		CompletionTime: &meta.CompletionTime,
+	})
+}
+
+// ClearAgentCompletion removes all completion metadata fields from an agent bead.
+// Called when a polecat is re-slung with new work (resets stale completion state).
+func (b *Beads) ClearAgentCompletion(id string) error {
+	empty := ""
+	notFailed := false
+	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
+		ExitType:       &empty,
+		MRID:           &empty,
+		Branch:         &empty,
+		MRFailed:       &notFailed,
+		CompletionTime: &empty,
+	})
 }
 
 // GetAgentNotificationLevel returns the notification level for an agent.
@@ -646,43 +615,61 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 	}
 
 	fields := ParseAgentFields(issue.Description)
+	// Prefer the structured agent_state column when present.
+	// Some writers (for example, `bd agent state`) update the DB column directly
+	// without rewriting the description text, so description-derived state can be stale.
+	if issue.AgentState != "" {
+		fields.AgentState = issue.AgentState
+	}
 	return issue, fields, nil
 }
 
 // ListAgentBeads returns all agent beads in a single query.
 // Returns a map of agent bead ID to Issue.
 //
-// Queries both the wisps table (primary, for migrated agent beads) and
-// the issues table (backward compat during migration). Wisps take
-// precedence for duplicate IDs.
+// Queries both the issues table (authoritative metadata source) and the
+// wisps table (fallback existence source). Issues take precedence for duplicate
+// IDs so labels/type are preserved for doctor validation.
 func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
-	result := make(map[string]*Issue)
-
-	// Query wisps table first (primary source after agent bead migration).
-	// Gracefully ignore errors — wisps table may not exist yet.
-	if wispBeads, _ := b.ListAgentBeadsFromWisps(); len(wispBeads) > 0 {
-		for id, issue := range wispBeads {
-			result[id] = issue
-		}
-	}
-
-	// Also query issues table (backward compat during migration).
-	out, err := b.run("list", "--label=gt:agent", "--json")
-	if err != nil && len(result) == 0 {
+	// Query issues table first. Issues include labels and type metadata used by
+	// doctor checks (for example, validating gt:agent labels).
+	// Agent beads are type=agent (infrastructure), hidden by bd list default filter.
+	// Use --include-infra so they appear in results.
+	out, err := b.run("list", "--label=gt:agent", "--include-infra", "--json", "--no-pager")
+	if err != nil {
 		return nil, err
 	}
-	if err == nil {
-		var issues []*Issue
-		if jsonErr := json.Unmarshal(out, &issues); jsonErr == nil {
-			for _, issue := range issues {
-				if _, exists := result[issue.ID]; !exists {
-					result[issue.ID] = issue
-				}
-			}
-		}
+	issuesByID := make(map[string]*Issue)
+	var issues []*Issue
+	if jsonErr := json.Unmarshal(out, &issues); jsonErr != nil {
+		return nil, fmt.Errorf("parsing bd list --json output: %w (raw output %d bytes)", jsonErr, len(out))
+	}
+	for _, issue := range issues {
+		issuesByID[issue.ID] = issue
 	}
 
-	return result, nil
+	// Query wisps table as a fallback source.
+	// Keep issues-table entries when both exist for the same ID so richer
+	// metadata (labels/type) is preserved.
+	wispBeads, _ := b.ListAgentBeadsFromWisps()
+
+	return mergeAgentBeadSources(issuesByID, wispBeads), nil
+}
+
+// mergeAgentBeadSources merges issue-backed and wisp-backed agent bead maps.
+// Issues are authoritative because they carry full metadata (labels/type),
+// while wisps are treated as a fallback existence source.
+func mergeAgentBeadSources(issuesByID, wispsByID map[string]*Issue) map[string]*Issue {
+	merged := make(map[string]*Issue, len(issuesByID)+len(wispsByID))
+	for id, issue := range issuesByID {
+		merged[id] = issue
+	}
+	for id, issue := range wispsByID {
+		if _, exists := merged[id]; !exists {
+			merged[id] = issue
+		}
+	}
+	return merged
 }
 
 // ListAgentBeadsFromWisps queries the wisps table for agent beads.
@@ -719,17 +706,23 @@ func (b *Beads) ListAgentBeadsFromWisps() (map[string]*Issue, error) {
 }
 
 // isAgentBeadByID detects agent beads by their ID naming convention.
-// Agent bead IDs follow the pattern: prefix-rig-role[-name]
+// Agent bead IDs follow two patterns:
+//   - Full form (prefix != rig): prefix-rig-role[-name] (e.g., gt-gastown-witness)
+//   - Collapsed form (prefix == rig): prefix-role[-name] (e.g., bcc-witness)
+//
 // where role is one of: witness, refinery, crew, polecat, deacon, mayor.
+// The collapsed form has only 2 parts for role-only IDs, so we must check
+// from parts[1:] not parts[2:].
 func isAgentBeadByID(id string) bool {
 	parts := strings.Split(id, "-")
-	if len(parts) < 3 {
+	if len(parts) < 2 {
 		return false
 	}
-	// Check if any part matches an agent role keyword
-	for _, part := range parts[2:] {
+	// Check parts[1:] to handle both full-form (role at parts[2]) and
+	// collapsed-form (role at parts[1]) agent bead IDs.
+	for _, part := range parts[1:] {
 		switch part {
-		case "witness", "refinery", "crew", "polecat", "deacon", "mayor":
+		case constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew, constants.RolePolecat, constants.RoleDeacon, constants.RoleMayor:
 			return true
 		}
 	}

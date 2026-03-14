@@ -12,7 +12,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -20,6 +22,19 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+func hasACPSessionByName(townRoot, sessionName string) bool {
+	if townRoot == "" {
+		return false
+	}
+
+	// Currently only the Mayor supports ACP.
+	if sessionName == session.MayorSessionName() {
+		return mayor.IsACPActive(townRoot)
+	}
+
+	return false
+}
 
 var (
 	nudgeMessageFlag  string
@@ -49,33 +64,35 @@ func init() {
 	nudgeCmd.Flags().BoolVarP(&nudgeForceFlag, "force", "f", false, "Send even if target has DND enabled")
 	nudgeCmd.Flags().BoolVar(&nudgeStdinFlag, "stdin", false, "Read message from stdin (avoids shell quoting issues)")
 	nudgeCmd.Flags().BoolVar(&nudgeIfFreshFlag, "if-fresh", false, "Only send if caller's tmux session is <60s old (suppresses compaction nudges)")
-	nudgeCmd.Flags().StringVar(&nudgeModeFlag, "mode", NudgeModeImmediate, "Delivery mode: immediate (default), queue, or wait-idle")
+	nudgeCmd.Flags().StringVar(&nudgeModeFlag, "mode", NudgeModeWaitIdle, "Delivery mode: wait-idle (default), queue, or immediate")
 	nudgeCmd.Flags().StringVar(&nudgePriorityFlag, "priority", nudge.PriorityNormal, "Queue priority: normal (default) or urgent")
 }
 
 var nudgeCmd = &cobra.Command{
-	Use:     "nudge <target> [message]",
-	GroupID: GroupComm,
-	Short:   "Send a synchronous message to any Gas Town worker",
+	Use:         "nudge <target> [message]",
+	GroupID:     GroupComm,
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Send a synchronous message to any Gas Town worker",
 	Long: `Universal messaging API for Gas Town worker-to-worker communication.
 
 Delivers a message to any worker's Claude Code session: polecats, crew,
 witness, refinery, mayor, or deacon.
 
 Delivery modes (--mode):
-  immediate  Send directly via tmux send-keys (default). Interrupts in-flight
-             work but guarantees immediate delivery.
-  queue      Write to a file queue; agent picks up via hook at next turn
-             boundary. Zero interruption. Use for non-urgent coordination.
   wait-idle  Wait for agent to become idle (prompt visible), then deliver
              directly. Falls back to queue on timeout. If both idle-wait and
              queue fail, falls back to immediate delivery as a last resort.
+             This is the default — it avoids interrupting active tool calls.
+  queue      Write to a file queue; agent picks up via hook at next turn
+             boundary. Zero interruption. Use for non-urgent coordination.
+  immediate  Send directly via tmux send-keys. Interrupts in-flight work
+             but guarantees immediate delivery. Use only when you need to
+             break through (e.g., stuck agent, emergency).
 
-Queue and wait-idle modes require the target agent to support hooks
-(UserPromptSubmit) for drain. Agents without hook support should use immediate.
-
-The default is immediate for backward compatibility. For non-urgent messages
-where you don't want to interrupt the agent's current work, use --mode=queue.
+Queue and wait-idle modes require a drain mechanism. Claude agents drain
+via UserPromptSubmit hook; other agents use a background nudge-poller
+that periodically drains and injects via tmux. If neither is available,
+use --mode=immediate.
 
 This is the ONLY way to send messages to Claude sessions.
 Do not use raw tmux send-keys elsewhere.
@@ -121,6 +138,18 @@ const ifFreshMaxAge = 60 * time.Second
 // This is a var (not const) so tests can override it to avoid 15s waits.
 var waitIdleTimeout = 15 * time.Second
 
+// idleWatcherTimeout is how long the background idle watcher polls after
+// queuing a nudge. If the agent becomes idle within this window, the watcher
+// drains the queue and delivers directly. This covers the gap where an agent
+// finishes work after WaitForIdle's timeout but before anyone sends new input
+// (so UserPromptSubmit never fires and the queue never drains).
+// Var so tests can override.
+var idleWatcherTimeout = 60 * time.Second
+
+// idleWatcherPollInterval is how often the background watcher checks for idle.
+// Var so tests can override.
+var idleWatcherPollInterval = 1 * time.Second
+
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -128,12 +157,19 @@ var waitIdleTimeout = 15 * time.Second
 func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 	townRoot, _ := workspace.FindFromCwd()
 
+	// Use the requested mode, but force queue mode for ACP sessions.
+	// ACP agents don't have tmux panes to send-keys to.
+	mode := nudgeModeFlag
+	if hasACPSessionByName(townRoot, sessionName) {
+		mode = NudgeModeQueue
+	}
+
 	// For direct tmux delivery, prefix with sender attribution.
 	// Queue-based delivery stores Sender as a separate field and
 	// FormatForInjection adds the prefix, so we must NOT double-prefix.
 	prefixedMessage := fmt.Sprintf("[from %s] %s", sender, message)
 
-	switch nudgeModeFlag {
+	switch mode {
 	case NudgeModeQueue:
 		if townRoot == "" {
 			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
@@ -150,11 +186,51 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// rather than silently degrading to immediate (destructive) delivery.
 			return fmt.Errorf("--mode=wait-idle requires a Gas Town workspace")
 		}
+		// Check if the target agent supports prompt-based idle detection.
+		// WaitForIdle uses Claude Code's prompt pattern (❯) and status bar (⏵⏵).
+		// Non-Claude agents (Gemini, Codex, etc.) have no ReadyPromptPrefix,
+		// so WaitForIdle produces false positives — it sees no busy indicator
+		// and matches stale prompt characters in the pane buffer. (GH#gt-5ey3)
+		// Degrade to queue mode for agents without prompt-based detection.
+		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
+			preset := config.GetAgentPresetByName(agentName)
+			if preset != nil && preset.ReadyPromptPrefix == "" {
+				fmt.Fprintf(os.Stderr, "wait-idle: %s agent %q has no prompt detection, using queue mode\n", sessionName, agentName)
+				if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+					Sender:   sender,
+					Message:  message,
+					Priority: nudgePriorityFlag,
+				}); qErr != nil {
+					formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+						Sender:   sender,
+						Message:  message,
+						Priority: nudgePriorityFlag,
+					}})
+					return t.NudgeSession(sessionName, formatted)
+				}
+				// Ensure a nudge-poller is running so the queue actually drains.
+				// The poller is normally started by gt crew start, but if the
+				// session was started manually (or the poller crashed), queued
+				// nudges sit undelivered forever. StartPoller is idempotent —
+				// it no-ops if a poller is already alive for this session.
+				if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
+					fmt.Fprintf(os.Stderr, "wait-idle: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
+				}
+				return nil
+			}
+		}
 		// Try to wait for idle
 		err := t.WaitForIdle(sessionName, waitIdleTimeout)
 		if err == nil {
-			// Agent is idle — safe to deliver directly
-			return t.NudgeSession(sessionName, prefixedMessage)
+			// Agent is idle — deliver directly. Format as system-reminder
+			// so the agent processes it as a background notification rather
+			// than a user interruption/correction.
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}})
+			return t.NudgeSession(sessionName, formatted)
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
@@ -170,13 +246,89 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// Queue failed — fall back to immediate as last resort.
 			// Better to interrupt than lose the message entirely.
 			fmt.Fprintf(os.Stderr, "Warning: queue fallback failed (%v), delivering immediately\n", qErr)
-			return t.NudgeSession(sessionName, prefixedMessage)
+			// Still use FormatForInjection so the agent sees a consistent
+			// <system-reminder> format regardless of delivery path.
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}})
+			return t.NudgeSession(sessionName, formatted)
 		}
+		// Run watcher synchronously: polls for idle over a longer window.
+		// The UserPromptSubmit hook drains the queue on agent input, but an
+		// idle agent receives no input — so queued nudges are lost without
+		// this watcher. It exits on: delivery, session death, or timeout.
+		// Must be synchronous (not a goroutine) because gt nudge is a CLI
+		// command — the process exits after return, killing any goroutines.
+		watchAndDeliver(t, townRoot, sessionName)
 		return nil
 
 	default: // NudgeModeImmediate
-		return t.NudgeSession(sessionName, prefixedMessage)
+		opts := tmux.NudgeOpts{}
+		// Check if the target agent uses Escape as cancel (e.g., Gemini CLI).
+		// For these agents, skip the Escape keystroke to avoid canceling
+		// in-flight generation. (GH#gt-wasn)
+		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
+			if preset := config.GetAgentPresetByName(agentName); preset != nil && preset.EscapeCancelsRequest {
+				opts.SkipEscape = true
+			}
+		}
+		return t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
 	}
+}
+
+// watchAndDeliver polls a session for idle state over idleWatcherTimeout.
+// When the agent becomes idle, it drains the nudge queue and sends the
+// formatted content directly via NudgeSession. This bypasses the
+// UserPromptSubmit hook entirely — that hook does not fire for tmux
+// send-keys input, so we cannot rely on it.
+//
+// This runs synchronously — gt nudge blocks until the watcher exits.
+// Errors are logged to stderr rather than returned since delivery failure
+// after successful queue write is non-fatal (queue persists for next drain).
+//
+// Exit conditions:
+//   - Agent becomes idle: drain queue and deliver formatted content, exit.
+//   - Queue is empty (someone else drained it): exit.
+//   - Session disappears: exit (nothing to deliver to).
+//   - Timeout: exit (queue stays for next input or watcher cycle).
+func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
+	deadline := time.Now().Add(idleWatcherTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(idleWatcherPollInterval)
+
+		// If queue is already empty, someone else drained it.
+		if nudge.QueueLen(townRoot, sessionName) == 0 {
+			return
+		}
+
+		// Check if session still exists — no point watching a dead session.
+		if exists, _ := t.HasSession(sessionName); !exists {
+			return
+		}
+
+		// Use WaitForIdle with a short timeout instead of single-snapshot
+		// IsIdle to get the consecutive-poll guard (2 polls 200ms apart).
+		// This avoids false positives during inter-tool-call gaps where
+		// the prompt briefly appears while Claude Code is still working.
+		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
+			// Drain atomically claims queued entries (rename-based).
+			// If another process raced and drained first, we get an
+			// empty slice and skip delivery to avoid duplicates.
+			drained, _ := nudge.Drain(townRoot, sessionName)
+			if len(drained) == 0 {
+				return
+			}
+			formatted := nudge.FormatForInjection(drained)
+			if err := t.NudgeSession(sessionName, formatted); err != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+			}
+			return
+		}
+	}
+	// Timeout — nudge stays in queue for next watcher or manual drain.
 }
 
 // validNudgeModes is the set of allowed --mode values.
@@ -254,7 +406,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	if roleInfo, err := GetRole(); err == nil {
 		switch roleInfo.Role {
 		case RoleMayor:
-			sender = "mayor"
+			sender = constants.RoleMayor
 		case RoleCrew:
 			sender = fmt.Sprintf("%s/crew/%s", roleInfo.Rig, roleInfo.Polecat)
 		case RolePolecat:
@@ -264,7 +416,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		case RoleRefinery:
 			sender = fmt.Sprintf("%s/refinery", roleInfo.Rig)
 		case RoleDeacon:
-			sender = "deacon"
+			sender = constants.RoleDeacon
 		default:
 			sender = string(roleInfo.Role)
 		}
@@ -278,6 +430,13 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Check DND status for target (unless force flag or channel target)
 	townRoot, _ := workspace.FindFromCwd()
+	if townRoot != "" {
+		// Initialize tmux socket and prefix registry so NewTmux() connects
+		// to the correct town socket. Without this, nudge from non-agent
+		// contexts (e.g., crew workspaces without GT_TOWN_SOCKET) falls
+		// through to the sentinel socket and fails to find sessions.
+		_ = session.InitRegistry(townRoot)
+	}
 	if townRoot != "" && !nudgeForceFlag {
 		shouldSend, level, _ := shouldNudgeTarget(townRoot, target, nudgeForceFlag)
 		if !shouldSend {
@@ -292,9 +451,9 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	// Expand role shortcuts to session names
 	// These shortcuts let users type "mayor" instead of "gt-mayor"
 	switch target {
-	case "mayor":
+	case constants.RoleMayor:
 		target = session.MayorSessionName()
-	case "witness", "refinery":
+	case constants.RoleWitness, constants.RoleRefinery:
 		// These need the current rig
 		roleInfo, err := GetRole()
 		if err != nil {
@@ -304,7 +463,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot determine rig for %s shortcut (not in a rig context)", target)
 		}
 		rigPrefix := session.PrefixFor(roleInfo.Rig)
-		if target == "witness" {
+		if target == constants.RoleWitness {
 			target = session.WitnessSessionName(rigPrefix)
 		} else {
 			target = session.RefinerySessionName(rigPrefix)
@@ -312,14 +471,16 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Special case: "deacon" target maps to the Deacon session
-	if target == "deacon" {
+	if target == constants.RoleDeacon {
 		deaconSession := session.DeaconSessionName()
-		// Check if Deacon session exists
-		exists, err := t.HasSession(deaconSession)
-		if err != nil {
-			return fmt.Errorf("checking deacon session: %w", err)
+		// Check if Deacon session exists (tmux or ACP)
+		hasACP := hasACPSessionByName(townRoot, deaconSession)
+		exists := false
+		if !hasACP {
+			exists, _ = t.HasSession(deaconSession)
 		}
-		if !exists {
+
+		if !hasACP && !exists {
 			// Deacon not running - this is not an error, just log and return
 			fmt.Printf("%s Deacon not running, nudge skipped\n", style.Dim.Render("○"))
 			return nil
@@ -333,9 +494,9 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Log nudge event
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			_ = LogNudge(townRoot, "deacon", message)
+			_ = LogNudge(townRoot, constants.RoleDeacon, message)
 		}
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", "deacon", message))
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", constants.RoleDeacon, message))
 		return nil
 	}
 
@@ -382,7 +543,8 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		// For queue/wait-idle modes, verify session exists before enqueuing.
 		// Without this, queue mode silently succeeds for nonexistent sessions —
 		// the file is written but never drained.
-		if nudgeModeFlag != NudgeModeImmediate {
+		// ACP sessions are always allowed as they use queue mode.
+		if nudgeModeFlag != NudgeModeImmediate && !hasACPSessionByName(townRoot, sessionName) {
 			exists, err := t.HasSession(sessionName)
 			if err != nil {
 				return fmt.Errorf("checking session: %w", err)
@@ -406,12 +568,17 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload(rigName, target, message))
 	} else {
 		// Raw session name (legacy)
-		exists, err := t.HasSession(target)
-		if err != nil {
-			return fmt.Errorf("checking session: %w", err)
-		}
-		if !exists {
-			return fmt.Errorf("session %q not found", target)
+		// Check for ACP session - ACP agents don't have tmux sessions but can receive nudges via queue
+		hasACP := hasACPSessionByName(townRoot, target)
+
+		if !hasACP {
+			exists, err := t.HasSession(target)
+			if err != nil {
+				return fmt.Errorf("checking session: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("session %q not found", target)
+			}
 		}
 
 		if err := deliverNudge(t, target, message, sender); err != nil {
@@ -546,15 +713,16 @@ func runNudgeChannel(channelName, message, sender string) error {
 //   - Wildcard: "gastown/polecats/*" → all polecat sessions in gastown
 //   - Role: "*/witness" → all witness sessions
 //   - Special: "mayor", "deacon" → gt-{town}-mayor, gt-{town}-deacon
+//
 // townName is used to generate the correct session names for mayor/deacon.
 func resolveNudgePattern(pattern string, agents []*AgentSession) []string {
 	var results []string
 
 	// Handle special cases
 	switch pattern {
-	case "mayor":
+	case constants.RoleMayor:
 		return []string{session.MayorSessionName()}
-	case "deacon":
+	case constants.RoleDeacon:
 		return []string{session.DeaconSessionName()}
 	}
 
@@ -593,11 +761,11 @@ func resolveNudgePattern(pattern string, agents []*AgentSession) []string {
 			if suffix != "*" && suffix != agent.AgentName {
 				continue
 			}
-		} else if targetPattern == "witness" {
+		} else if targetPattern == constants.RoleWitness {
 			if agent.Type != AgentWitness {
 				continue
 			}
-		} else if targetPattern == "refinery" {
+		} else if targetPattern == constants.RoleRefinery {
 			if agent.Type != AgentRefinery {
 				continue
 			}
@@ -658,9 +826,9 @@ func sessionNameToAddress(sessionName string) string {
 	// Use short address format: rig/name (not rig/polecats/name)
 	switch identity.Role {
 	case session.RoleMayor:
-		return "mayor"
+		return constants.RoleMayor
 	case session.RoleDeacon:
-		return "deacon"
+		return constants.RoleDeacon
 	case session.RoleWitness:
 		return fmt.Sprintf("%s/witness", identity.Rig)
 	case session.RoleRefinery:
@@ -685,9 +853,9 @@ func sessionNameToAddress(sessionName string) string {
 func addressToAgentBeadID(address string) string {
 	// Handle special cases
 	switch address {
-	case "mayor":
+	case constants.RoleMayor:
 		return session.MayorSessionName()
-	case "deacon":
+	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	}
 
@@ -705,9 +873,9 @@ func addressToAgentBeadID(address string) string {
 	role := parts[1]
 
 	switch role {
-	case "witness":
+	case constants.RoleWitness:
 		return session.WitnessSessionName(session.PrefixFor(rig))
-	case "refinery":
+	case constants.RoleRefinery:
 		return session.RefinerySessionName(session.PrefixFor(rig))
 	default:
 		// Assume polecat

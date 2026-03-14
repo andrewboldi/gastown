@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -25,7 +27,7 @@ func TestNew(t *testing.T) {
 func TestListOptions(t *testing.T) {
 	opts := ListOptions{
 		Status:   "open",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 1,
 	}
 	if opts.Status != "open" {
@@ -33,11 +35,24 @@ func TestListOptions(t *testing.T) {
 	}
 }
 
+// TestListOptionsEphemeral verifies that Ephemeral flag is preserved.
+func TestListOptionsEphemeral(t *testing.T) {
+	opts := ListOptions{
+		Label:     "gt:merge-request",
+		Status:    "open",
+		Priority:  -1,
+		Ephemeral: true,
+	}
+	if !opts.Ephemeral {
+		t.Error("Ephemeral should be true")
+	}
+}
+
 // TestCreateOptions verifies CreateOptions fields.
 func TestCreateOptions(t *testing.T) {
 	opts := CreateOptions{
 		Title:       "Test issue",
-		Type:        "task",
+		Labels:      []string{"gt:task"},
 		Priority:    2,
 		Description: "A test description",
 		Parent:      "gt-abc",
@@ -79,6 +94,70 @@ func TestIsFlagLikeTitle(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("IsFlagLikeTitle(%q) = %v, want %v", tt.title, got, tt.want)
 		}
+	}
+}
+
+func TestBdSupportsAllowStale_ReprobesWhenBinaryPathChanges(t *testing.T) {
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	supportingDir := t.TempDir()
+	nonSupportingDir := t.TempDir()
+	writeAllowStaleBDStub(t, supportingDir, true)
+	writeAllowStaleBDStub(t, nonSupportingDir, false)
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", supportingDir+string(os.PathListSeparator)+origPath)
+	if !BdSupportsAllowStale() {
+		t.Fatal("expected first stub to support --allow-stale")
+	}
+
+	t.Setenv("PATH", nonSupportingDir+string(os.PathListSeparator)+origPath)
+	if BdSupportsAllowStale() {
+		t.Fatal("expected second stub to be re-probed and report no --allow-stale support")
+	}
+}
+
+func writeAllowStaleBDStub(t *testing.T, dir string, supportsAllowStale bool) {
+	t.Helper()
+
+	var scriptPath, script string
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.Join(dir, "bd.bat")
+		exitCode := "1"
+		if supportsAllowStale {
+			exitCode = "0"
+		}
+		script = fmt.Sprintf(`@echo off
+setlocal enableextensions
+if "%%1"=="--allow-stale" exit /b %s
+exit /b 1
+`, exitCode)
+	} else {
+		scriptPath = filepath.Join(dir, "bd")
+		exitCode := "1"
+		if supportsAllowStale {
+			exitCode = "0"
+		}
+		script = fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  exit %s
+fi
+exit 1
+`, exitCode)
+	}
+
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
 	}
 }
 
@@ -140,6 +219,57 @@ func TestWrapError(t *testing.T) {
 				t.Errorf("wrapError(%q) = %v, want %v", tt.stderr, err, tt.wantErr)
 			}
 		}
+	}
+}
+
+// TestNormalizeBugTitle tests title normalization for duplicate detection.
+func TestNormalizeBugTitle(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool // should they match?
+	}{
+		// Exact match after normalization
+		{"test_foo fails", "test_foo fails", true},
+		{"Test_foo Fails", "test_foo fails", true},
+		{" test_foo fails ", "test_foo fails", true},
+
+		// Common prefix stripping
+		{"Pre-existing failure: test_foo fails", "test_foo fails", true},
+		{"Pre-existing failure: test_foo fails", "Pre-existing: test_foo fails", true},
+		{"Test failure: test_foo fails", "test_foo fails", true},
+
+		// Different failures should NOT match
+		{"test_foo fails", "test_bar fails", false},
+		{"lint error in main.go", "test_foo fails", false},
+	}
+
+	for _, tt := range tests {
+		na := normalizeBugTitle(tt.a)
+		nb := normalizeBugTitle(tt.b)
+		got := na == nb
+		if got != tt.want {
+			t.Errorf("normalizeBugTitle(%q) == normalizeBugTitle(%q): got %v, want %v (normalized: %q vs %q)",
+				tt.a, tt.b, got, tt.want, na, nb)
+		}
+	}
+}
+
+// TestSearchOptions verifies SearchOptions fields.
+func TestSearchOptions(t *testing.T) {
+	opts := SearchOptions{
+		Query:  "test failure",
+		Status: "open",
+		Label:  "gt:bug",
+		Limit:  5,
+	}
+	if opts.Query != "test failure" {
+		t.Errorf("Query = %q, want 'test failure'", opts.Query)
+	}
+	if opts.Status != "open" {
+		t.Errorf("Status = %q, want 'open'", opts.Status)
+	}
+	if opts.Label != "gt:bug" {
+		t.Errorf("Label = %q, want 'gt:bug'", opts.Label)
 	}
 }
 
@@ -609,7 +739,7 @@ func TestMRFieldsRoundTrip(t *testing.T) {
 		t.Fatal("round-trip parse returned nil")
 	}
 
-	if *parsed != *original {
+	if !reflect.DeepEqual(parsed, original) {
 		t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", parsed, original)
 	}
 }
@@ -755,6 +885,17 @@ ATTACHED_AT: 2025-12-21T14:00:00Z`,
 				AttachedAt:       "2025-12-21T14:00:00Z",
 			},
 		},
+		{
+			name: "attached vars",
+			issue: &Issue{
+				Description: `attached_formula: mol-release
+attached_vars: ["version=1.2.3","channel=stable"]`,
+			},
+			wantFields: &AttachmentFields{
+				AttachedFormula: "mol-release",
+				AttachedVars:    []string{"version=1.2.3", "channel=stable"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -777,6 +918,9 @@ ATTACHED_AT: 2025-12-21T14:00:00Z`,
 			}
 			if fields.AttachedAt != tt.wantFields.AttachedAt {
 				t.Errorf("AttachedAt = %q, want %q", fields.AttachedAt, tt.wantFields.AttachedAt)
+			}
+			if !reflect.DeepEqual(fields.AttachedVars, tt.wantFields.AttachedVars) {
+				t.Errorf("AttachedVars = %#v, want %#v", fields.AttachedVars, tt.wantFields.AttachedVars)
 			}
 		})
 	}
@@ -814,6 +958,14 @@ attached_at: 2025-12-21T15:30:00Z`,
 				AttachedMolecule: "mol-abc",
 			},
 			want: "attached_molecule: mol-abc",
+		},
+		{
+			name: "attached vars",
+			fields: &AttachmentFields{
+				AttachedFormula: "mol-release",
+				AttachedVars:    []string{"version=1.2.3", "channel=stable"},
+			},
+			want: "attached_formula: mol-release\nattached_vars: [\"version=1.2.3\",\"channel=stable\"]",
 		},
 	}
 
@@ -926,7 +1078,7 @@ func TestAttachmentFieldsRoundTrip(t *testing.T) {
 		t.Fatal("round-trip parse returned nil")
 	}
 
-	if *parsed != *original {
+	if !reflect.DeepEqual(parsed, original) {
 		t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", parsed, original)
 	}
 }
@@ -999,7 +1151,7 @@ func TestNoMergeField(t *testing.T) {
 		if parsed == nil {
 			t.Fatal("round-trip parse returned nil")
 		}
-		if *parsed != *original {
+		if !reflect.DeepEqual(parsed, original) {
 			t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", parsed, original)
 		}
 	})
@@ -1199,10 +1351,10 @@ func TestParseAgentBeadID(t *testing.T) {
 		// Worker name collides with role keyword + hyphenated rig
 		{"gt-my-rig-polecat-witness", "my-rig", "polecat", "witness", true},
 		// Collapsed form: prefix == rig (e.g., rig "ff" with prefix "ff")
-		{"ff-witness", "ff", "witness", "", true},            // collapsed rig-level singleton
-		{"ff-refinery", "ff", "refinery", "", true},          // collapsed rig-level singleton
-		{"ff-polecat-nux", "ff", "polecat", "nux", true},    // collapsed named agent
-		{"ff-crew-dave", "ff", "crew", "dave", true},         // collapsed named agent
+		{"ff-witness", "ff", "witness", "", true},                // collapsed rig-level singleton
+		{"ff-refinery", "ff", "refinery", "", true},              // collapsed rig-level singleton
+		{"ff-polecat-nux", "ff", "polecat", "nux", true},         // collapsed named agent
+		{"ff-crew-dave", "ff", "crew", "dave", true},             // collapsed named agent
 		{"ff-polecat-war-boy", "ff", "polecat", "war-boy", true}, // collapsed named with hyphen
 		// Parseable but not valid agent roles (IsAgentSessionBead will reject)
 		{"gt-abc123", "", "abc123", "", true}, // Parses as town-level but not valid role
@@ -1846,14 +1998,100 @@ func TestDelegationTerms(t *testing.T) {
 
 // TestSetupRedirect tests the beads redirect setup for worktrees.
 func TestSetupRedirect(t *testing.T) {
-	t.Run("crew worktree with local beads", func(t *testing.T) {
-		// Setup: town/rig/.beads (local, no redirect)
+	t.Run("rig with own DB redirects to rig-level beads", func(t *testing.T) {
+		// When rig has its own dolt_database in metadata.json, crew must
+		// redirect to rig-level .beads (not town-level) to see correct prefix.
+		townRoot := t.TempDir()
+		townBeads := filepath.Join(townRoot, ".beads")
+		rigRoot := filepath.Join(townRoot, "testrig")
+		rigBeads := filepath.Join(rigRoot, ".beads")
+		crewPath := filepath.Join(rigRoot, "crew", "max")
+
+		// Create both town-level and rig-level beads
+		if err := os.MkdirAll(filepath.Join(townBeads, "dolt"), 0755); err != nil {
+			t.Fatalf("mkdir town beads: %v", err)
+		}
+		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+			t.Fatalf("mkdir rig beads: %v", err)
+		}
+		// Rig has its own database (e.g., laneassist with lc- prefix)
+		meta := []byte(`{"dolt_database":"testrig","backend":"dolt"}`)
+		if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"), meta, 0644); err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+		if err := os.MkdirAll(crewPath, 0755); err != nil {
+			t.Fatalf("mkdir crew: %v", err)
+		}
+
+		if err := SetupRedirect(townRoot, crewPath); err != nil {
+			t.Fatalf("SetupRedirect failed: %v", err)
+		}
+
+		redirectPath := filepath.Join(crewPath, ".beads", "redirect")
+		content, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("read redirect: %v", err)
+		}
+
+		// 2 levels up to rig root: crew/max -> testrig, then .beads
+		want := "../../.beads\n"
+		if string(content) != want {
+			t.Errorf("redirect content = %q, want %q", string(content), want)
+		}
+
+		// Verify redirect resolves to rig-level, NOT town-level
+		resolved := ResolveBeadsDir(crewPath)
+		if resolved != rigBeads {
+			t.Errorf("resolved = %q, want %q (rig-level)", resolved, rigBeads)
+		}
+	})
+
+	t.Run("rig without own DB redirects to town-level beads", func(t *testing.T) {
+		// When rig has no own database, crew should use town-level .beads.
+		townRoot := t.TempDir()
+		townBeads := filepath.Join(townRoot, ".beads")
+		rigRoot := filepath.Join(townRoot, "testrig")
+		crewPath := filepath.Join(rigRoot, "crew", "max")
+
+		// Create town-level beads with dolt DB
+		if err := os.MkdirAll(filepath.Join(townBeads, "dolt"), 0755); err != nil {
+			t.Fatalf("mkdir town beads: %v", err)
+		}
+		if err := os.MkdirAll(crewPath, 0755); err != nil {
+			t.Fatalf("mkdir crew: %v", err)
+		}
+
+		if err := SetupRedirect(townRoot, crewPath); err != nil {
+			t.Fatalf("SetupRedirect failed: %v", err)
+		}
+
+		redirectPath := filepath.Join(crewPath, ".beads", "redirect")
+		content, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("read redirect: %v", err)
+		}
+
+		// 3 levels up: crew/max -> testrig -> townRoot, then .beads
+		want := "../../../.beads\n"
+		if string(content) != want {
+			t.Errorf("redirect content = %q, want %q", string(content), want)
+		}
+
+		// Verify redirect resolves to town-level
+		resolved := ResolveBeadsDir(crewPath)
+		if resolved != townBeads {
+			t.Errorf("resolved = %q, want %q", resolved, townBeads)
+		}
+	})
+
+	t.Run("crew worktree falls back to rig-level beads", func(t *testing.T) {
+		// When neither rig metadata nor town-level .beads exists, fall back to rig-level (2 levels up).
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
 		rigBeads := filepath.Join(rigRoot, ".beads")
 		crewPath := filepath.Join(rigRoot, "crew", "max")
 
-		// Create rig structure
+		// Create rig-level beads only (no town-level, no metadata.json)
 		if err := os.MkdirAll(rigBeads, 0755); err != nil {
 			t.Fatalf("mkdir rig beads: %v", err)
 		}
@@ -2283,9 +2521,6 @@ func TestSetupRedirect(t *testing.T) {
 	})
 }
 
-
-
-
 // TestResetAgentBeadForReuse_NukeRespawnCycle tests the preferred nuke→respawn
 // lifecycle using ResetAgentBeadForReuse (gt-14b8o fix). This keeps the bead open
 // with agent_state="nuked", avoiding the close/reopen cycle
@@ -2382,29 +2617,24 @@ func TestResetAgentBeadForReuse_NukeRespawnCycle(t *testing.T) {
 	t.Log("LIFECYCLE TEST PASSED: spawn → reset → respawn works without close/reopen")
 }
 
-
-
-
-
-
 // TestIsAgentBead verifies the IsAgentBead function correctly identifies agent
 // beads by checking both the gt:agent label (preferred) and the legacy type field.
 func TestIsAgentBead(t *testing.T) {
 	tests := []struct {
-		name   string
-		issue  *Issue
-		want   bool
+		name  string
+		issue *Issue
+		want  bool
 	}{
 		{
-			name: "nil issue",
+			name:  "nil issue",
 			issue: nil,
-			want: false,
+			want:  false,
 		},
 		{
 			name: "agent with legacy type",
 			issue: &Issue{
-				ID:   "gt-gastown-polecat-toast",
-				Type: "agent",
+				ID:     "gt-gastown-polecat-toast",
+				Type:   "agent",
 				Labels: []string{},
 			},
 			want: true,
@@ -2412,8 +2642,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "agent with gt:agent label",
 			issue: &Issue{
-				ID:   "gt-gastown-polecat-toast",
-				Type: "task",
+				ID:     "gt-gastown-polecat-toast",
+				Type:   "task",
 				Labels: []string{"gt:agent"},
 			},
 			want: true,
@@ -2421,8 +2651,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "agent with both type and label",
 			issue: &Issue{
-				ID:   "gt-gastown-polecat-toast",
-				Type: "agent",
+				ID:     "gt-gastown-polecat-toast",
+				Type:   "agent",
 				Labels: []string{"gt:agent", "other-label"},
 			},
 			want: true,
@@ -2430,8 +2660,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "not an agent - task type without label",
 			issue: &Issue{
-				ID:   "gt-abc123",
-				Type: "task",
+				ID:     "gt-abc123",
+				Type:   "task",
 				Labels: []string{},
 			},
 			want: false,
@@ -2439,8 +2669,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "not an agent - bug type with other labels",
 			issue: &Issue{
-				ID:   "gt-xyz456",
-				Type: "bug",
+				ID:     "gt-xyz456",
+				Type:   "bug",
 				Labels: []string{"priority-high", "blocked"},
 			},
 			want: false,
@@ -2448,8 +2678,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "agent with gt:agent label and other labels",
 			issue: &Issue{
-				ID:   "gt-gastown-witness",
-				Type: "task",
+				ID:     "gt-gastown-witness",
+				Type:   "task",
 				Labels: []string{"priority-high", "gt:agent", "status-running"},
 			},
 			want: true,
@@ -2606,6 +2836,55 @@ func TestStripEnvPrefixes_PreservesOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// translateDoltPort tests
+// ---------------------------------------------------------------------------
+
+// TestTranslateDoltPort verifies GT_DOLT_PORT → BEADS_DOLT_PORT translation.
+// This is the core fix for hq-27t: gastown sets GT_DOLT_PORT but bd only reads
+// BEADS_DOLT_PORT. Without translation, bd falls back to metadata.json port 3307.
+func TestTranslateDoltPort(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{
+			name: "translates GT to BEADS",
+			env:  []string{"GT_DOLT_PORT=12345", "PATH=/usr/bin"},
+			want: []string{"GT_DOLT_PORT=12345", "PATH=/usr/bin", "BEADS_DOLT_PORT=12345"},
+		},
+		{
+			name: "skips if BEADS_DOLT_PORT already set",
+			env:  []string{"GT_DOLT_PORT=12345", "BEADS_DOLT_PORT=99999"},
+			want: []string{"GT_DOLT_PORT=12345", "BEADS_DOLT_PORT=99999"},
+		},
+		{
+			name: "no-op without GT_DOLT_PORT",
+			env:  []string{"PATH=/usr/bin"},
+			want: []string{"PATH=/usr/bin"},
+		},
+		{
+			name: "empty env",
+			env:  []string{},
+			want: []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := translateDoltPort(tt.env)
+			if len(got) != len(tt.want) {
+				t.Fatalf("translateDoltPort() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }
 
@@ -2797,87 +3076,4 @@ func TestIsSubprocessCrash(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestCreateAgentBeadViaJSONL verifies the JSONL fallback creates valid entries (GH#1769).
-func TestCreateAgentBeadViaJSONL(t *testing.T) {
-	t.Run("creates valid JSONL entry", func(t *testing.T) {
-		beadsDir := filepath.Join(t.TempDir(), ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		issue, err := createAgentBeadViaJSONL(beadsDir, "gt-testrig-witness", "Witness for testrig", "Witness description\n\nrole_type: witness")
-		if err != nil {
-			t.Fatalf("createAgentBeadViaJSONL failed: %v", err)
-		}
-
-		if issue.ID != "gt-testrig-witness" {
-			t.Errorf("ID = %q, want %q", issue.ID, "gt-testrig-witness")
-		}
-		if issue.Status != "open" {
-			t.Errorf("Status = %q, want %q", issue.Status, "open")
-		}
-		if issue.Type != "agent" {
-			t.Errorf("Type = %q, want %q", issue.Type, "agent")
-		}
-		if len(issue.Labels) != 1 || issue.Labels[0] != "gt:agent" {
-			t.Errorf("Labels = %v, want [gt:agent]", issue.Labels)
-		}
-
-		// Verify JSONL file was created with valid content
-		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		data, err := os.ReadFile(jsonlPath)
-		if err != nil {
-			t.Fatalf("reading issues.jsonl: %v", err)
-		}
-
-		var parsed Issue
-		if err := json.Unmarshal(data[:len(data)-1], &parsed); err != nil { // trim trailing newline
-			t.Fatalf("parsing JSONL entry: %v", err)
-		}
-		if parsed.ID != "gt-testrig-witness" {
-			t.Errorf("parsed ID = %q, want %q", parsed.ID, "gt-testrig-witness")
-		}
-		if parsed.Type != "agent" {
-			t.Errorf("parsed Type = %q, want %q", parsed.Type, "agent")
-		}
-	})
-
-	t.Run("appends to existing JSONL file", func(t *testing.T) {
-		beadsDir := filepath.Join(t.TempDir(), ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		// Create first entry
-		_, err := createAgentBeadViaJSONL(beadsDir, "gt-testrig-witness", "Witness", "desc1")
-		if err != nil {
-			t.Fatalf("first create failed: %v", err)
-		}
-
-		// Create second entry
-		_, err = createAgentBeadViaJSONL(beadsDir, "gt-testrig-refinery", "Refinery", "desc2")
-		if err != nil {
-			t.Fatalf("second create failed: %v", err)
-		}
-
-		// Verify both entries are present
-		data, err := os.ReadFile(filepath.Join(beadsDir, "issues.jsonl"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		if len(lines) != 2 {
-			t.Errorf("expected 2 JSONL lines, got %d", len(lines))
-		}
-	})
-
-	t.Run("fails gracefully on read-only directory", func(t *testing.T) {
-		// Use a non-existent path (can't write)
-		_, err := createAgentBeadViaJSONL("/nonexistent/.beads", "gt-test", "Test", "desc")
-		if err == nil {
-			t.Error("expected error for non-existent directory")
-		}
-	})
 }

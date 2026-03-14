@@ -72,7 +72,7 @@ func TestIsSlingableType(t *testing.T) {
 func TestIsIssueBlocked_NoStore(t *testing.T) {
 	// isIssueBlocked with nil store should fail-open (return false, not panic).
 	// This covers the "store unavailable" failure mode (F-17).
-	result := isIssueBlocked(context.Background(), nil, "test-any-id")
+	result := isIssueBlocked(context.Background(), nil, "test-any-id", nil)
 	if result {
 		t.Error("isIssueBlocked should fail-open (return false) with nil store")
 	}
@@ -171,7 +171,7 @@ func TestCheckConvoysForIssue_NilLogger(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBlockingDepTypes_ContainsExpectedTypes(t *testing.T) {
-	expected := []string{"blocks", "conditional-blocks", "waits-for"}
+	expected := []string{"blocks", "conditional-blocks", "waits-for", "merge-blocks"}
 	for _, depType := range expected {
 		if !blockingDepTypes[depType] {
 			t.Errorf("blockingDepTypes should contain %q", depType)
@@ -186,9 +186,9 @@ func TestBlockingDepTypes_ExcludesParentChild(t *testing.T) {
 }
 
 func TestBlockingDepTypes_ExactSize(t *testing.T) {
-	// Ensure the map has exactly the 3 expected entries and no extras.
-	if len(blockingDepTypes) != 3 {
-		t.Errorf("blockingDepTypes has %d entries, want 3; contents: %v", len(blockingDepTypes), blockingDepTypes)
+	// Ensure the map has exactly the 4 expected entries and no extras.
+	if len(blockingDepTypes) != 4 {
+		t.Errorf("blockingDepTypes has %d entries, want 4; contents: %v", len(blockingDepTypes), blockingDepTypes)
 	}
 }
 
@@ -216,7 +216,7 @@ func TestIsIssueBlocked_NoDeps(t *testing.T) {
 		t.Fatalf("CreateIssue: %v", err)
 	}
 
-	if isIssueBlocked(ctx, store, issue.ID) {
+	if isIssueBlocked(ctx, store, issue.ID, nil) {
 		t.Error("isIssueBlocked should return false for issue with no dependencies")
 	}
 }
@@ -274,7 +274,7 @@ func TestIsIssueBlocked_BlockedByOpenBlocker(t *testing.T) {
 		t.Fatal("expected at least 1 dependency to be created")
 	}
 
-	result := isIssueBlocked(ctx, store, blocked.ID)
+	result := isIssueBlocked(ctx, store, blocked.ID, nil)
 
 	// GetDependenciesWithMetadata may not work in embedded Dolt mode
 	// (nested query limitation). If it fails, isIssueBlocked returns false
@@ -335,7 +335,7 @@ func TestIsIssueBlocked_NotBlockedByClosedBlocker(t *testing.T) {
 
 	// Even if GetDependenciesWithMetadata works, the blocker is closed so
 	// isIssueBlocked should return false.
-	if isIssueBlocked(ctx, store, blocked.ID) {
+	if isIssueBlocked(ctx, store, blocked.ID, nil) {
 		t.Error("isIssueBlocked should return false when the only blocker is closed")
 	}
 }
@@ -385,7 +385,7 @@ func TestIsIssueBlocked_ParentChildDoesNotBlock(t *testing.T) {
 	}
 
 	// parent-child deps should NOT block dispatch
-	if isIssueBlocked(ctx, store, child.ID) {
+	if isIssueBlocked(ctx, store, child.ID, nil) {
 		t.Error("isIssueBlocked should return false for parent-child dependency (not a blocking type)")
 	}
 }
@@ -397,8 +397,188 @@ func TestIsIssueBlocked_FailOpenOnNonexistentIssue(t *testing.T) {
 	ctx := context.Background()
 
 	// Querying deps for a nonexistent issue should fail-open (return false)
-	if isIssueBlocked(ctx, store, "test-nonexistent-issue") {
+	if isIssueBlocked(ctx, store, "test-nonexistent-issue", nil) {
 		t.Error("isIssueBlocked should fail-open (return false) for nonexistent issue")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// merge-blocks dependency tests (#1893)
+// ---------------------------------------------------------------------------
+
+func TestIsIssueBlocked_MergeBlocksStillBlockedWhenClosedWithoutMerge(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Blocker is closed but has no CloseReason (gt done without merge)
+	blocker := &beadsdk.Issue{
+		ID:        "test-mblkr1",
+		Title:     "Closed No Merge",
+		Status:    beadsdk.StatusClosed,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	blocked := &beadsdk.Issue{
+		ID:        "test-mblkd1",
+		Title:     "Merge-Blocked",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := store.CreateIssue(ctx, blocker, "test"); err != nil {
+		t.Fatalf("CreateIssue blocker: %v", err)
+	}
+	if err := store.CreateIssue(ctx, blocked, "test"); err != nil {
+		t.Fatalf("CreateIssue blocked: %v", err)
+	}
+
+	dep := &beadsdk.Dependency{
+		IssueID:     blocked.ID,
+		DependsOnID: blocker.ID,
+		Type:        beadsdk.DependencyType("merge-blocks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	result := isIssueBlocked(ctx, store, blocked.ID, nil)
+
+	// Check if GetDependenciesWithMetadata works in embedded mode
+	if !result {
+		_, metaErr := store.GetDependenciesWithMetadata(ctx, blocked.ID)
+		if metaErr != nil {
+			t.Skipf("GetDependenciesWithMetadata not supported in embedded mode: %v", metaErr)
+		}
+		t.Error("isIssueBlocked should return true for merge-blocks dep when blocker is closed without merge")
+	}
+}
+
+func TestIsIssueBlocked_MergeBlocksUnblockedWhenMerged(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Blocker is closed WITH merge confirmation
+	blocker := &beadsdk.Issue{
+		ID:          "test-mblkr2",
+		Title:       "Merged Blocker",
+		Status:      beadsdk.StatusClosed,
+		CloseReason: "Merged in mr-xyz",
+		Priority:    2,
+		IssueType:   beadsdk.TypeTask,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	blocked := &beadsdk.Issue{
+		ID:        "test-mblkd2",
+		Title:     "Merge-Blocked By Merged",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := store.CreateIssue(ctx, blocker, "test"); err != nil {
+		t.Fatalf("CreateIssue blocker: %v", err)
+	}
+	if err := store.CreateIssue(ctx, blocked, "test"); err != nil {
+		t.Fatalf("CreateIssue blocked: %v", err)
+	}
+
+	dep := &beadsdk.Dependency{
+		IssueID:     blocked.ID,
+		DependsOnID: blocker.ID,
+		Type:        beadsdk.DependencyType("merge-blocks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	// Blocker is closed with "Merged in mr-xyz" — should NOT be blocked
+	if isIssueBlocked(ctx, store, blocked.ID, nil) {
+		// Check if it's the embedded Dolt issue
+		_, metaErr := store.GetDependenciesWithMetadata(ctx, blocked.ID)
+		if metaErr != nil {
+			t.Skipf("GetDependenciesWithMetadata not supported in embedded mode: %v", metaErr)
+		}
+		t.Error("isIssueBlocked should return false when merge-blocks blocker has CloseReason 'Merged in ...'")
+	}
+}
+
+func TestIsIssueBlocked_MergeBlocksUnblockedOnTombstone(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Create blocker as open first, then transition to tombstone
+	blocker := &beadsdk.Issue{
+		ID:        "test-mblkr3",
+		Title:     "Tombstone Blocker",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	blocked := &beadsdk.Issue{
+		ID:        "test-mblkd3",
+		Title:     "Merge-Blocked By Tombstone",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := store.CreateIssue(ctx, blocker, "test"); err != nil {
+		t.Fatalf("CreateIssue blocker: %v", err)
+	}
+	if err := store.CreateIssue(ctx, blocked, "test"); err != nil {
+		t.Fatalf("CreateIssue blocked: %v", err)
+	}
+
+	dep := &beadsdk.Dependency{
+		IssueID:     blocked.ID,
+		DependsOnID: blocker.ID,
+		Type:        beadsdk.DependencyType("merge-blocks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	// Transition to tombstone
+	if err := store.UpdateIssue(ctx, blocker.ID, map[string]interface{}{
+		"status": "tombstone",
+	}, "test"); err != nil {
+		t.Fatalf("UpdateIssue to tombstone: %v", err)
+	}
+
+	// Tombstone always unblocks, regardless of dep type
+	if isIssueBlocked(ctx, store, blocked.ID, nil) {
+		_, metaErr := store.GetDependenciesWithMetadata(ctx, blocked.ID)
+		if metaErr != nil {
+			t.Skipf("GetDependenciesWithMetadata not supported in embedded mode: %v", metaErr)
+		}
+		t.Error("isIssueBlocked should return false when merge-blocks blocker is tombstoned")
 	}
 }
 
@@ -626,7 +806,7 @@ func TestFeedNextReadyIssue_DispatchesFirstReadyIssue(t *testing.T) {
 	gtPath, logPath := makeGTStub(t, 0)
 	logger, _ := makeLogger()
 
-	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false })
+	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
 	// Verify gt was called with the ready issue
 	logData, err := os.ReadFile(logPath)
@@ -703,7 +883,7 @@ func TestFeedNextReadyIssue_SkipsEpicAndDispatchesTask(t *testing.T) {
 	gtPath, logPath := makeGTStub(t, 0)
 	logger, _ := makeLogger()
 
-	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false })
+	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
@@ -806,7 +986,7 @@ func TestFeedNextReadyIssue_SkipsBlockedIssue(t *testing.T) {
 	gtPath, logPath := makeGTStub(t, 0)
 	logger, logMsgs := makeLogger()
 
-	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false })
+	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
@@ -889,7 +1069,7 @@ func TestFeedNextReadyIssue_NoReadyIssues_LogsMessage(t *testing.T) {
 	gtPath, _ := makeGTStub(t, 0)
 	logger, logMsgs := makeLogger()
 
-	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false })
+	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
 	// Verify "no ready issues to feed" was logged
 	found := false
@@ -956,7 +1136,7 @@ func TestFeedNextReadyIssue_SkipsParkedRig(t *testing.T) {
 	logger, logMsgs := makeLogger()
 
 	// isRigParked always returns true
-	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return true })
+	feedNextReadyIssue(ctx, store, townRoot, convoy.ID, "test", logger, gtPath, func(string) bool { return true }, nil)
 
 	// gt should NOT have been called
 	if _, err := os.ReadFile(logPath); err == nil {
@@ -990,7 +1170,7 @@ func TestDispatchIssue_Success(t *testing.T) {
 	townRoot := t.TempDir()
 	gtPath, logPath := makeGTStub(t, 0)
 
-	err := dispatchIssue(context.Background(), townRoot, "test-abc", "myrig", gtPath)
+	err := dispatchIssue(context.Background(), townRoot, "test-abc", "myrig", gtPath, "")
 	if err != nil {
 		t.Fatalf("dispatchIssue returned error: %v", err)
 	}
@@ -1014,7 +1194,7 @@ func TestDispatchIssue_Failure(t *testing.T) {
 	townRoot := t.TempDir()
 	gtPath, _ := makeGTStub(t, 1)
 
-	err := dispatchIssue(context.Background(), townRoot, "test-fail", "myrig", gtPath)
+	err := dispatchIssue(context.Background(), townRoot, "test-fail", "myrig", gtPath, "")
 	if err == nil {
 		t.Fatal("dispatchIssue should return error when gt exits 1")
 	}
@@ -1310,5 +1490,197 @@ func TestCheckConvoysForIssue_FeedsAfterStagedToOpenTransition(t *testing.T) {
 		if strings.Contains(msg, "staged") && strings.Contains(msg, "skipping") {
 			t.Errorf("convoy should NOT be skipped after transition to open, but found: %s", msg)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cross-rig fallback tests
+// ---------------------------------------------------------------------------
+
+// setupTownRootWithCrossRig creates a town root with routes for both "test-"
+// (local rig) and "oag-" (cross-rig) prefixes. The cross-rig prefix points
+// to a directory with a bd stub.
+func setupTownRootWithCrossRig(t *testing.T, bdExitCode int, bdOutput string) (townRoot string, bdLogPath string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	townRoot = t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll .beads: %v", err)
+	}
+
+	// Create cross-rig directory with .beads
+	crossRigDir := filepath.Join(townRoot, "osr_ai_gm", ".beads")
+	if err := os.MkdirAll(crossRigDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll osr_ai_gm/.beads: %v", err)
+	}
+
+	// Routes: test- is local, oag- is cross-rig
+	routesContent := `{"prefix":"test-","path":"testrig/.beads"}` + "\n" +
+		`{"prefix":"oag-","path":"osr_ai_gm/.beads"}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0o644); err != nil {
+		t.Fatalf("WriteFile routes.jsonl: %v", err)
+	}
+
+	// Create bd stub in PATH
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll binDir: %v", err)
+	}
+	bdLogPath = filepath.Join(townRoot, "bd.log")
+
+	bdScript := fmt.Sprintf(`#!/bin/sh
+echo "CMD:$*" >> %q
+case "$1" in
+  show)
+    echo '%s'
+    exit %d
+    ;;
+esac
+exit 0
+`, bdLogPath, bdOutput, bdExitCode)
+
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	return townRoot, bdLogPath
+}
+
+func TestGetConvoyTrackedIssues_CrossRigFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Create convoy in the store (local)
+	convoy := &beadsdk.Issue{
+		ID:        "test-convoy-xrig",
+		Title:     "Cross-Rig Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.CreateIssue(ctx, convoy, "test"); err != nil {
+		t.Fatalf("CreateIssue convoy: %v", err)
+	}
+
+	// The cross-rig bead (oag-19dd9) is NOT in the local store.
+	// Add tracks dependency using external reference format expected by beads.
+	dep := &beadsdk.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: "external:oag:oag-19dd9",
+		Type:        beadsdk.DependencyType("tracks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	// Set up town root with cross-rig routes and bd stub returning "closed"
+	townRoot, _ := setupTownRootWithCrossRig(t, 0,
+		`[{"id":"oag-19dd9","status":"closed","assignee":"gastown/polecats/alpha","priority":2,"issue_type":"task"}]`)
+
+	tracked := getConvoyTrackedIssues(ctx, store, convoy.ID, townRoot, nil)
+
+	// Find the cross-rig bead in tracked results
+	var found *trackedIssue
+	for i := range tracked {
+		if tracked[i].ID == "oag-19dd9" {
+			found = &tracked[i]
+			break
+		}
+	}
+
+	if found == nil {
+		t.Skipf("oag-19dd9 not found in tracked issues (GetDependenciesWithMetadata may not work in embedded Dolt)")
+	}
+
+	// The critical assertion: the cross-rig bead should show fresh "closed" status,
+	// NOT the stale "open" from dependency metadata.
+	if found.Status != "closed" {
+		t.Errorf("cross-rig bead status = %q, want %q (stale metadata was used instead of fresh bd show)", found.Status, "closed")
+	}
+	if found.Assignee != "gastown/polecats/alpha" {
+		t.Errorf("cross-rig bead assignee = %q, want %q", found.Assignee, "gastown/polecats/alpha")
+	}
+}
+
+func TestFetchCrossRigBeadStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	townRoot, bdLogPath := setupTownRootWithCrossRig(t, 0,
+		`[{"id":"oag-abc","status":"closed","assignee":"","priority":1,"issue_type":"task"},{"id":"oag-xyz","status":"open","assignee":"gastown/polecats/beta","priority":3,"issue_type":"bug"}]`)
+
+	result := fetchCrossRigBeadStatus(townRoot, []string{"oag-abc", "oag-xyz"})
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(result))
+	}
+
+	abc := result["oag-abc"]
+	if abc == nil {
+		t.Fatal("oag-abc not found in results")
+	}
+	if string(abc.Status) != "closed" {
+		t.Errorf("oag-abc status = %q, want %q", abc.Status, "closed")
+	}
+
+	xyz := result["oag-xyz"]
+	if xyz == nil {
+		t.Fatal("oag-xyz not found in results")
+	}
+	if string(xyz.Status) != "open" {
+		t.Errorf("oag-xyz status = %q, want %q", xyz.Status, "open")
+	}
+	if xyz.Assignee != "gastown/polecats/beta" {
+		t.Errorf("oag-xyz assignee = %q, want %q", xyz.Assignee, "gastown/polecats/beta")
+	}
+
+	// Verify bd was called
+	logData, err := os.ReadFile(bdLogPath)
+	if err != nil {
+		t.Fatalf("bd stub not called (no log): %v", err)
+	}
+	logStr := string(logData)
+	if !strings.Contains(logStr, "show --json oag-abc oag-xyz") &&
+		!strings.Contains(logStr, "show --json oag-xyz oag-abc") {
+		t.Errorf("bd show not called with expected IDs: %q", logStr)
+	}
+}
+
+func TestFetchCrossRigBeadStatus_UnknownPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	townRoot, _ := setupTownRootWithCrossRig(t, 0, `[]`)
+
+	// "zzz-" prefix has no route — should return empty, not panic
+	result := fetchCrossRigBeadStatus(townRoot, []string{"zzz-unknown"})
+	if len(result) != 0 {
+		t.Errorf("expected 0 results for unknown prefix, got %d", len(result))
+	}
+}
+
+func TestFetchCrossRigBeadStatus_EmptyInput(t *testing.T) {
+	result := fetchCrossRigBeadStatus("/nonexistent", nil)
+	if len(result) != 0 {
+		t.Errorf("expected 0 results for empty input, got %d", len(result))
 	}
 }

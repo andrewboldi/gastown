@@ -18,9 +18,9 @@ func testRegistry() *PrefixRegistry {
 func TestParseSessionName(t *testing.T) {
 	reg := testRegistry()
 	// Also set as default for ParseSessionName (no-registry variant)
-	old := defaultRegistry
-	defaultRegistry = reg
-	defer func() { defaultRegistry = old }()
+	old := DefaultRegistry()
+	SetDefaultRegistry(reg)
+	defer func() { SetDefaultRegistry(old) }()
 
 	tests := []struct {
 		name       string
@@ -47,6 +47,20 @@ func TestParseSessionName(t *testing.T) {
 			session:  "hq-boot",
 			wantRole: RoleDeacon,
 			wantName: "boot",
+		},
+
+		// Dogs (town-level: hq-dog-<name>)
+		{
+			name:     "dog alpha",
+			session:  "hq-dog-alpha",
+			wantRole: RoleDog,
+			wantName: "alpha",
+		},
+		{
+			name:     "dog hyphenated name",
+			session:  "hq-dog-my-dog",
+			wantRole: RoleDog,
+			wantName: "my-dog",
 		},
 
 		// Witness (new format: <prefix>-witness)
@@ -243,6 +257,11 @@ func TestAgentIdentity_SessionName(t *testing.T) {
 			identity: AgentIdentity{Role: RolePolecat, Rig: "hop", Name: "ostrom", Prefix: "hop"},
 			want:     "hop-ostrom",
 		},
+		{
+			name:     "dog",
+			identity: AgentIdentity{Role: RoleDog, Name: "alpha"},
+			want:     "hq-dog-alpha",
+		},
 	}
 
 	for _, tt := range tests {
@@ -290,6 +309,11 @@ func TestAgentIdentity_Address(t *testing.T) {
 			identity: AgentIdentity{Role: RolePolecat, Rig: "gastown", Name: "Toast", Prefix: "gt"},
 			want:     "gastown/polecats/Toast",
 		},
+		{
+			name:     "dog",
+			identity: AgentIdentity{Role: RoleDog, Name: "alpha"},
+			want:     "deacon/dogs/alpha",
+		},
 	}
 
 	for _, tt := range tests {
@@ -303,14 +327,15 @@ func TestAgentIdentity_Address(t *testing.T) {
 
 func TestParseSessionName_RoundTrip(t *testing.T) {
 	reg := testRegistry()
-	old := defaultRegistry
-	defaultRegistry = reg
-	defer func() { defaultRegistry = old }()
+	old := DefaultRegistry()
+	SetDefaultRegistry(reg)
+	defer func() { SetDefaultRegistry(old) }()
 
 	// Test that parsing then reconstructing gives the same result
 	sessions := []string{
 		"hq-mayor",
 		"hq-deacon",
+		"hq-dog-alpha",
 		"gt-witness",
 		"bd-refinery",
 		"gt-crew-max",

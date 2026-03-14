@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/deacon"
@@ -22,12 +24,10 @@ import (
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
-	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/wisp"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -41,18 +41,18 @@ type agentStartResult struct {
 
 // UpOutput represents the JSON output of the up command.
 type UpOutput struct {
-	Success  bool              `json:"success"`
-	Services []ServiceStatus   `json:"services"`
-	Summary  UpSummary         `json:"summary"`
+	Success  bool            `json:"success"`
+	Services []ServiceStatus `json:"services"`
+	Summary  UpSummary       `json:"summary"`
 }
 
 // ServiceStatus represents the status of a single service.
 type ServiceStatus struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"` // daemon, deacon, mayor, witness, refinery, crew, polecat
-	Rig     string `json:"rig,omitempty"`
-	OK      bool   `json:"ok"`
-	Detail  string `json:"detail"`
+	Name   string `json:"name"`
+	Type   string `json:"type"` // daemon, deacon, mayor, witness, refinery, crew, polecat
+	Rig    string `json:"rig,omitempty"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
 }
 
 // UpSummary provides counts for the up command output.
@@ -153,6 +153,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
+	// Ensure lifecycle defaults are configured. On first run this creates
+	// mayor/daemon.json with sensible defaults for the six-stage Dolt lifecycle.
+	// On subsequent runs it fills in any newly added patrols without touching
+	// existing config. Errors are non-fatal — the town can run without lifecycle
+	// automation, it just won't have automated maintenance.
+	if err := daemon.EnsureLifecycleConfigFile(townRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not configure lifecycle defaults: %v\n", err)
+	}
+
 	// Load daemon.json env vars so services (Dolt, etc.) use the right config.
 	// The daemon does this too, but gt up starts services before the daemon.
 	if patrolCfg := daemon.LoadPatrolConfig(townRoot); patrolCfg != nil {
@@ -166,6 +175,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Discover rigs early so we can prefetch while daemon/deacon/mayor start
 	rigs := discoverRigs(townRoot)
+
+	// Safety: bring current agent out of DND on startup so orchestration nudges
+	// are not silently muted after a previous incident/debug session.
+	if changed, err := disableCurrentAgentDND(townRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not reset DND state: %v\n", err)
+	} else if changed && !upQuiet {
+		fmt.Printf("%s DND was enabled; reset to normal for current agent\n", style.SuccessPrefix)
+	}
 
 	// Start daemon, deacon, mayor, and rig prefetch in parallel
 	var daemonErr error
@@ -235,8 +252,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 		defer startupWg.Done()
 		mayorMgr := mayor.NewManager(townRoot)
 		if err := mayorMgr.Start(""); err != nil {
-			if err == mayor.ErrAlreadyRunning {
+			if errors.Is(err, mayor.ErrAlreadyRunning) {
 				mayorResult = agentStartResult{name: "Mayor", ok: true, detail: mayorMgr.SessionName()}
+			} else if errors.Is(err, mayor.ErrACPActive) {
+				mayorResult = agentStartResult{name: "Mayor", ok: true, detail: "ACP active"}
 			} else {
 				mayorResult = agentStartResult{name: "Mayor", ok: false, detail: err.Error()}
 			}
@@ -292,6 +311,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// was skipped, polling the port would just burn the full timeout. (review finding #1)
 	if !doltSkipped && doltOK {
 		waitForDoltReady(townRoot)
+		// Propagate Dolt port to process env so all subsequently spawned
+		// agents (witnesses, refineries, crew) inherit it. Without this,
+		// bd auto-starts rogue Dolt instances in agent tmux sessions. (GH#2412)
+		doltCfg := doltserver.DefaultConfig(townRoot)
+		portStr := fmt.Sprintf("%d", doltCfg.Port)
+		os.Setenv("GT_DOLT_PORT", portStr)
+		os.Setenv("BEADS_DOLT_PORT", portStr)
 	}
 
 	// 5 & 6. Witnesses and Refineries (using prefetched rigs)
@@ -405,6 +431,48 @@ func printStatus(name string, ok bool, detail string) {
 	} else {
 		fmt.Printf("%s %s: %s\n", style.ErrorPrefix, name, detail)
 	}
+}
+
+// disableCurrentAgentDND resets DND for the current role context (if muted).
+// Returns true when a change was applied.
+func disableCurrentAgentDND(townRoot string) (bool, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false, fmt.Errorf("getting current directory: %w", err)
+	}
+
+	roleInfo, err := GetRoleWithContext(cwd, townRoot)
+	if err != nil {
+		// No role context (or not in role workspace): nothing to change.
+		return false, nil
+	}
+
+	ctx := RoleContext{
+		Role:     roleInfo.Role,
+		Rig:      roleInfo.Rig,
+		Polecat:  roleInfo.Polecat,
+		TownRoot: townRoot,
+		WorkDir:  cwd,
+	}
+	agentBeadID := getAgentBeadID(ctx)
+	if agentBeadID == "" {
+		return false, nil
+	}
+
+	bd := beads.New(townRoot)
+	level, err := bd.GetAgentNotificationLevel(agentBeadID)
+	if err != nil {
+		// Missing bead/field should not block startup.
+		return false, nil
+	}
+	if level != beads.NotifyMuted {
+		return false, nil
+	}
+
+	if err := bd.UpdateAgentNotificationLevel(agentBeadID, beads.NotifyNormal); err != nil {
+		return false, fmt.Errorf("updating notification level for %s: %w", agentBeadID, err)
+	}
+	return true, nil
 }
 
 // ensureDaemon starts the daemon if not running.
@@ -597,12 +665,15 @@ func startRigAgentsWithPrefetch(rigNames []string, prefetchedRigs map[string]*ri
 func upStartWitness(rigName string, r *rig.Rig) agentStartResult {
 	name := "Witness (" + rigName + ")"
 
-	// Check if rig is parked or docked
-	townRoot := filepath.Dir(r.Path)
-	cfg := wisp.NewConfig(townRoot, rigName)
-	status := cfg.GetString("status")
-	if status == "parked" || status == "docked" {
-		return agentStartResult{name: name, ok: true, detail: fmt.Sprintf("skipped (rig %s)", status)}
+	// Check if rig is parked or docked (wisp + bead labels).
+	// Skip the check if auto_start_on_up is set — that overrides dock status.
+	// Also check deprecated auto_start_on_boot for backwards compatibility with
+	// rigs that still have the old key in their config.
+	if !r.GetBoolConfig("auto_start_on_up") && !r.GetBoolConfig("auto_start_on_boot") {
+		townRoot := filepath.Dir(r.Path)
+		if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
+			return agentStartResult{name: name, ok: true, detail: fmt.Sprintf("skipped (rig %s)", reason)}
+		}
 	}
 
 	mgr := witness.NewManager(r)
@@ -620,12 +691,15 @@ func upStartWitness(rigName string, r *rig.Rig) agentStartResult {
 func upStartRefinery(rigName string, r *rig.Rig) agentStartResult {
 	name := "Refinery (" + rigName + ")"
 
-	// Check if rig is parked or docked
-	townRoot := filepath.Dir(r.Path)
-	cfg := wisp.NewConfig(townRoot, rigName)
-	status := cfg.GetString("status")
-	if status == "parked" || status == "docked" {
-		return agentStartResult{name: name, ok: true, detail: fmt.Sprintf("skipped (rig %s)", status)}
+	// Check if rig is parked or docked (wisp + bead labels).
+	// Skip the check if auto_start_on_up is set — that overrides dock status.
+	// Also check deprecated auto_start_on_boot for backwards compatibility with
+	// rigs that still have the old key in their config.
+	if !r.GetBoolConfig("auto_start_on_up") && !r.GetBoolConfig("auto_start_on_boot") {
+		townRoot := filepath.Dir(r.Path)
+		if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
+			return agentStartResult{name: name, ok: true, detail: fmt.Sprintf("skipped (rig %s)", reason)}
+		}
 	}
 
 	mgr := refinery.NewManager(r)
@@ -890,3 +964,4 @@ func waitForDoltReady(townRoot string) {
 		fmt.Fprintf(os.Stderr, "Warning: %v (agents may see connection errors)\n", err)
 	}
 }
+

@@ -1,20 +1,23 @@
 package refinery
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -133,12 +136,18 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Background mode: spawn a Claude agent in a tmux session
 	// The Claude agent handles MR processing using git commands and beads
 
-	// Working directory is the refinery worktree (shares .git with mayor/polecats)
+	// Working directory is the refinery worktree (shares .git with mayor/polecats).
+	// If the worktree is missing (pruned, deleted, or corrupted), auto-repair it
+	// from the shared bare repo (.repo.git) instead of falling back to mayor/rig.
+	// Falling back to mayor/rig causes the refinery to operate in the mayor's
+	// clone, which can interfere with mayor operations and confuse agents.
 	refineryRigDir := filepath.Join(m.rig.Path, "refinery", "rig")
 	if _, err := os.Stat(refineryRigDir); os.IsNotExist(err) {
-		// Fall back to mayor/rig (legacy architecture) - ensures we use project git, not town git.
-		// Using rig.Path directly would find town's .git with rig-named remotes instead of "origin".
-		refineryRigDir = filepath.Join(m.rig.Path, "mayor", "rig")
+		if repairErr := m.repairRefineryWorktree(refineryRigDir); repairErr != nil {
+			// Repair failed — fall back to mayor/rig as last resort.
+			_, _ = fmt.Fprintf(m.output, "⚠ Could not repair refinery worktree: %v (falling back to mayor/rig)\n", repairErr)
+			refineryRigDir = filepath.Join(m.rig.Path, "mayor", "rig")
+		}
 	}
 
 	// Ensure runtime settings exist in the shared refinery parent directory.
@@ -173,6 +182,9 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
+	// Generate the GASTA run ID for this refinery session.
+	runID := uuid.New().String()
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := t.NewSessionWithCommand(sessionID, refineryRigDir, command); err != nil {
@@ -182,10 +194,11 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "refinery",
-		Rig:      m.rig.Name,
-		TownRoot: townRoot,
-		Agent:    agentOverride,
+		Role:        "refinery",
+		Rig:         m.rig.Name,
+		TownRoot:    townRoot,
+		Agent:       agentOverride,
+		SessionName: sessionID,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 
@@ -196,6 +209,7 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
+	_ = t.SetEnvironment(sessionID, "GT_RUN", runID)
 
 	// Apply theme (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.AssignTheme(m.rig.Name)
@@ -214,7 +228,56 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	}
 
 	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
+	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
 
+	// Stream refinery's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
+	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
+		if err := session.ActivateAgentLogging(sessionID, refineryRigDir, runID); err != nil {
+			log.Printf("warning: agent log watcher setup failed for %s: %v", sessionID, err)
+		}
+	}
+
+	// Record the agent instantiation event (GASTA root span).
+	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
+		"refinery", "refinery", sessionID, m.rig.Name, townRoot, "", refineryRigDir)
+
+	return nil
+}
+
+// repairRefineryWorktree recreates a missing refinery/rig worktree from the
+// shared bare repo (.repo.git). The refinery worktree is created during
+// `gt rig add` but can be lost if `git worktree prune` runs, the directory
+// is deleted, or the .git file becomes corrupted. This self-heals on startup
+// instead of requiring manual intervention.
+func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
+	bareRepoPath := filepath.Join(m.rig.Path, ".repo.git")
+	if _, err := os.Stat(bareRepoPath); os.IsNotExist(err) {
+		return fmt.Errorf("bare repo not found at %s", bareRepoPath)
+	}
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(refineryRigDir), 0755); err != nil {
+		return fmt.Errorf("creating refinery dir: %w", err)
+	}
+
+	// Prune stale worktree entries so git doesn't reject the add
+	bareGit := git.NewGitWithDir(bareRepoPath, "")
+	_ = bareGit.WorktreePrune()
+
+	// Create worktree on the rig's default branch
+	defaultBranch := m.rig.DefaultBranch()
+	if err := bareGit.WorktreeAddExisting(refineryRigDir, defaultBranch); err != nil {
+		return fmt.Errorf("git worktree add: %w", err)
+	}
+
+	// Configure hooks path (matches rig add behavior)
+	refineryGit := git.NewGit(refineryRigDir)
+	if err := refineryGit.ConfigureHooksPath(); err != nil {
+		// Non-fatal: worktree is usable without hooks
+		_, _ = fmt.Fprintf(m.output, "⚠ Could not configure hooks for repaired worktree: %v\n", err)
+	}
+
+	_, _ = fmt.Fprintf(m.output, "✓ Auto-repaired missing refinery worktree at %s\n", refineryRigDir)
 	return nil
 }
 
@@ -241,7 +304,7 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 	// Query beads for open merge-request issues
 	// BeadsPath() returns the git-synced beads location
 	b := beads.New(m.rig.BeadsPath())
-	issues, err := b.List(beads.ListOptions{
+	issues, err := b.ListMergeRequests(beads.ListOptions{
 		Label:    "gt:merge-request",
 		Status:   "open",
 		Priority: -1, // No priority filter
@@ -424,8 +487,8 @@ func (m *Manager) FindMR(idOrBranch string) (*MergeRequest, error) {
 		if constants.BranchPolecatPrefix+idOrBranch == item.MR.Branch {
 			return item.MR, nil
 		}
-		// Match by worker name (partial match for convenience)
-		if strings.Contains(item.MR.ID, idOrBranch) {
+		// Match by ID prefix (partial match for convenience)
+		if strings.HasPrefix(item.MR.ID, idOrBranch) {
 			return item.MR, nil
 		}
 	}
@@ -483,49 +546,81 @@ func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*Merg
 	return mr, nil
 }
 
+// PostMergeResult holds the result of a post-merge cleanup operation.
+type PostMergeResult struct {
+	MR                  *MergeRequest
+	MRClosed            bool
+	SourceIssueClosed   bool
+	SourceIssueID       string
+	SourceIssueNotFound bool // true if source issue doesn't exist (already closed or invalid)
+}
+
+// PostMerge performs post-merge cleanup for a successfully merged MR.
+// It closes the MR bead and its source issue. Branch deletion is handled
+// by the caller since the Manager doesn't have git access.
+func (m *Manager) PostMerge(idOrBranch string) (*PostMergeResult, error) {
+	mr, err := m.FindMR(idOrBranch)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &PostMergeResult{
+		MR:            mr,
+		SourceIssueID: mr.IssueID,
+	}
+
+	b := beads.New(m.rig.BeadsPath())
+
+	// Close the MR bead
+	if mr.IsClosed() {
+		_, _ = fmt.Fprintf(m.output, "  %s MR already closed\n", style.Dim.Render("—"))
+		result.MRClosed = true
+	} else {
+		if err := b.CloseWithReason("merged", mr.ID); err != nil {
+			return result, fmt.Errorf("closing MR bead: %w", err)
+		}
+		if closeErr := mr.Close(CloseReasonMerged); closeErr != nil {
+			_, _ = fmt.Fprintf(m.output, "Warning: failed to update MR state: %v\n", closeErr)
+		}
+		result.MRClosed = true
+	}
+
+	// Close the source issue with reason and --force to bypass dependency checks.
+	// The source issue may have an attached molecule (wisp) whose open steps
+	// would block a normal bd close. ForceCloseWithReason bypasses this,
+	// matching how gt done handles closures for the no-MR path.
+	if mr.IssueID != "" {
+		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
+		if err := b.ForceCloseWithReason(closeReason, mr.IssueID); err != nil {
+			// Check if already closed (by polecat's gt done) — that's fine
+			if issue, showErr := b.Show(mr.IssueID); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
+				_, _ = fmt.Fprintf(m.output, "  %s source issue already closed: %s\n", style.Dim.Render("○"), mr.IssueID)
+				result.SourceIssueClosed = true
+			} else {
+				_, _ = fmt.Fprintf(m.output, "  %s source issue close: %v\n", style.Dim.Render("○"), err)
+				result.SourceIssueNotFound = true
+			}
+		} else {
+			result.SourceIssueClosed = true
+		}
+	}
+
+	return result, nil
+}
+
 // notifyWorkerRejected sends a rejection notification to a polecat.
 func (m *Manager) notifyWorkerRejected(mr *MergeRequest, reason string) {
-	router := mail.NewRouter(m.workDir)
-	msg := &mail.Message{
-		From:    fmt.Sprintf("%s/refinery", m.rig.Name),
-		To:      fmt.Sprintf("%s/%s", m.rig.Name, mr.Worker),
-		Subject: "Merge request rejected",
-		Body: fmt.Sprintf(`Your merge request has been rejected.
-
-Branch: %s
-Issue: %s
-Reason: %s
-
-Please review the feedback and address the issues before resubmitting.`,
-			mr.Branch, mr.IssueID, reason),
-		Priority: mail.PriorityNormal,
-	}
-	if err := router.Send(msg); err != nil {
-		log.Printf("warning: notifying worker of rejection for %s: %v", mr.IssueID, err)
+	// Nudge polecat about rejection instead of sending permanent mail.
+	polecatName := strings.TrimPrefix(mr.Worker, "polecats/")
+	target := fmt.Sprintf("%s/%s", m.rig.Name, polecatName)
+	nudgeMsg := fmt.Sprintf("MR rejected: branch=%s issue=%s reason=%s — review feedback and resubmit with 'gt done'",
+		mr.Branch, mr.IssueID, reason)
+	nudgeCmd := exec.Command("gt", "nudge", target, nudgeMsg)
+	nudgeCmd.Dir = m.workDir
+	if err := nudgeCmd.Run(); err != nil {
+		log.Printf("warning: nudging worker about rejection for %s: %v", mr.IssueID, err)
 	}
 }
 
-// findTownRoot walks up directories to find the town root.
-func findTownRoot(startPath string) string {
-	path := startPath
-	for {
-		// Check for mayor/ subdirectory (indicates town root)
-		if _, err := os.Stat(filepath.Join(path, "mayor")); err == nil {
-			return path
-		}
-		// Check for config.json with type: workspace
-		configPath := filepath.Join(path, "config.json")
-		if data, err := os.ReadFile(configPath); err == nil {
-			if strings.Contains(string(data), `"type": "workspace"`) {
-				return path
-			}
-		}
-
-		parent := filepath.Dir(path)
-		if parent == path {
-			break // Reached root
-		}
-		path = parent
-	}
-	return ""
-}
+// Town root is computed in Start() as filepath.Dir(m.rig.Path) and passed
+// through to callers — no filesystem-inference function needed (ZFC gt-qago).

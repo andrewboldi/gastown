@@ -78,14 +78,14 @@ in git history — only a closed PR comment links them to the work.
 
 ### Directory Guidelines
 
-**For ANY rig's git operations, use `~/gt/<rig>/mayor/rig/`.**
+**For ANY rig's git operations, use `{{ .TownRoot }}/<rig>/mayor/rig/`.**
 
 | Location | Use for |
 |----------|---------|
-| `~/gt` (town root) | `{{ cmd }} mail`, coordination, `bd` with `hq-` prefix |
-| `~/gt/<rig>/mayor/rig/` | **ALL git/code operations** for that rig |
-| `~/gt/<rig>/crew/*` | Other agents' workspaces — don't use these |
-| `~/gt/<rig>/polecats/*` | Polecat sandboxes — don't use these |
+| `{{ .TownRoot }}` (town root) | `{{ cmd }} mail`, coordination, `bd` with `hq-` prefix |
+| `{{ .TownRoot }}/<rig>/mayor/rig/` | **ALL git/code operations** for that rig |
+| `{{ .TownRoot }}/<rig>/crew/*` | Other agents' workspaces — don't use these |
+| `{{ .TownRoot }}/<rig>/polecats/*` | Polecat sandboxes — don't use these |
 
 ---
 
@@ -112,7 +112,7 @@ Town ({{ .TownRoot }})
 
 | Level | Location | Prefix | Purpose |
 |-------|----------|--------|---------|
-| Town | `~/gt/.beads/` | `hq-*` | Your mail, HQ coordination |
+| Town | `{{ .TownRoot }}/.beads/` | `hq-*` | Your mail, HQ coordination |
 | Rig | `<rig>/crew/*/.beads/` | project prefix | Project issues |
 
 **Key points:**
@@ -130,7 +130,7 @@ bd show {{ .IssuePrefix }}-xyz   # Routes to {{ .RigName }} beads (from anywhere
 bd show hq-abc      # Routes to town beads
 ```
 
-Routes defined in `~/gt/.beads/routes.jsonl`. `{{ cmd }} rig add` auto-registers new prefixes.
+Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` auto-registers new prefixes.
 **Debug:** `BD_DEBUG_ROUTING=1 bd show <id>`. **Conflicts:** `bd rename-prefix <new>`.
 
 ## Where to File Beads (CRITICAL)
@@ -168,7 +168,7 @@ Routes defined in `~/gt/.beads/routes.jsonl`. `{{ cmd }} rig add` auto-registers
 - **Strategic decisions**: Architecture, priorities, integration planning
 
 **NOT your job**: Per-worker cleanup, session killing, routine nudging (Witness handles that)
-**Exception**: If refinery/witness is stuck, use `{{ cmd }} nudge refinery "Process MQ"`
+**Exception**: If refinery/witness is stuck, use `{{ cmd }} nudge --mode=immediate refinery "Process MQ"`
 
 ## Key Commands
 
@@ -177,8 +177,9 @@ Routes defined in `~/gt/.beads/routes.jsonl`. `{{ cmd }} rig add` auto-registers
 - `{{ cmd }} mail read <id>` — Read a specific message
 - `{{ cmd }} mail send <addr> -s "Subject" -m "Message"` — Send mail
 - `{{ cmd }} mail mark-read <id>` — Mark message as read
-- `{{ cmd }} nudge <target> "message"` — Send message to agent session
+- `{{ cmd }} nudge <target> "message"` — Send message to agent session (default: wait-idle)
   **ALWAYS use gt nudge, NEVER tmux send-keys**
+  Use `--mode=immediate` only for stuck agents. Default waits for idle, falls back to queue.
 
 ### Status & Coordination
 - `{{ cmd }} status` — Overall town status
@@ -256,6 +257,7 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 
 | Want to... | Correct command | Common mistake |
 |------------|----------------|----------------|
+| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |
 | Dispatch work to polecat | `{{ cmd }} sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |
 | Message another agent | `{{ cmd }} nudge <target> "msg"` | ~~tmux send-keys~~ (unreliable) |
 | Kill stuck polecat | `{{ cmd }} polecat nuke <rig>/<name> --force` | ~~gt polecat kill~~ (not a command) |
@@ -263,10 +265,44 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 | Permanently disable rig | `{{ cmd }} rig dock <rig>` | ~~gt rig park~~ (temporary only) |
 | Create issues | `bd create "title"` | ~~gt issue create~~ (not a command) |
 
+**Beads valid statuses:** `open`, `in_progress`, `blocked`, `deferred`, `closed`, `pinned`, `hooked`
+(there is NO `done` or `complete` status)
+
 **Rig lifecycle commands (park vs dock vs stop):**
 - `park/unpark` — Temporary pause. Daemon skips parked rigs.
 - `dock/undock` — Persistent disable. Survives daemon restarts.
 - `stop/start` — Immediate stop/start of rig patrol agents (witness + refinery).
 - `restart/reboot` — Stop then start rig agents.
+
+## Rig Wake/Sleep Protocol
+
+**Default state: all rigs are docked (dormant).** Witnesses, refineries, and
+polecats do not run. The daemon does not auto-restart agents for docked rigs.
+Slinging work to a docked rig is blocked.
+
+**Wake a rig** when the human requests work in that project:
+
+```bash
+{{ cmd }} rig undock <rig>             # Remove docked label (persistent)
+{{ cmd }} rig start <rig>              # Start witness + refinery immediately
+# Now you can sling work:
+{{ cmd }} sling <bead> <rig>           # Dispatch polecat
+```
+
+**Sleep a rig** when all work is done and expectations are met:
+
+```bash
+# Verify: no open polecats, no pending MRs, no convoy work in progress
+{{ cmd }} polecat list <rig>           # Should be empty
+{{ cmd }} convoy list                  # No active convoys for this rig
+{{ cmd }} rig dock <rig>               # Dock: stops agents, blocks sling, persists
+```
+
+**Rules:**
+- Only undock a rig when the human explicitly asks for work in that project
+- Dock the rig back when the requested work is complete
+- Never leave a rig undocked and idle — dormant rigs save API costs and CPU
+- Use `{{ cmd }} rig config set <rig> auto_start_on_up true --global` for rigs
+  that should always start on `{{ cmd }} up` (rare — most rigs stay dormant)
 
 Town root: {{ .TownRoot }}

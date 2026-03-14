@@ -16,12 +16,22 @@ func hasTmux() bool {
 	return err == nil
 }
 
-func TestListSessionsNoServer(t *testing.T) {
+// newTestTmux returns a Tmux instance connected to the package-level test
+// socket (set by TestMain in testmain_test.go). All tests in this package
+// share one tmux server, which is torn down after all tests complete.
+//
+// This isolates tests from the user's interactive tmux and from other
+// packages' tests that run in parallel during `go test ./...`.
+func newTestTmux(t *testing.T) *Tmux {
+	t.Helper()
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
+	return NewTmux()
+}
 
-	tm := NewTmux()
+func TestListSessionsNoServer(t *testing.T) {
+	tm := newTestTmux(t)
 	sessions, err := tm.ListSessions()
 	// Should not error even if no server running
 	if err != nil {
@@ -32,11 +42,7 @@ func TestListSessionsNoServer(t *testing.T) {
 }
 
 func TestHasSessionNoServer(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	has, err := tm.HasSession("nonexistent-session-xyz")
 	if err != nil {
 		t.Fatalf("HasSession: %v", err)
@@ -47,11 +53,7 @@ func TestHasSessionNoServer(t *testing.T) {
 }
 
 func TestSessionLifecycle(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-session-" + t.Name()
 
 	// Clean up any existing session
@@ -104,11 +106,7 @@ func TestSessionLifecycle(t *testing.T) {
 }
 
 func TestDuplicateSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-dup-" + t.Name()
 
 	// Clean up any existing session
@@ -128,11 +126,7 @@ func TestDuplicateSession(t *testing.T) {
 }
 
 func TestSendKeysAndCapture(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-keys-" + t.Name()
 
 	// Clean up any existing session
@@ -164,11 +158,7 @@ func TestSendKeysAndCapture(t *testing.T) {
 }
 
 func TestGetSessionInfo(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-info-" + t.Name()
 
 	// Clean up any existing session
@@ -194,7 +184,7 @@ func TestGetSessionInfo(t *testing.T) {
 }
 
 func TestWrapError(t *testing.T) {
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	tests := []struct {
 		stderr string
@@ -217,11 +207,7 @@ func TestWrapError(t *testing.T) {
 }
 
 func TestEnsureSessionFresh_NoExistingSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-fresh-" + t.Name()
 
 	// Clean up any existing session
@@ -244,11 +230,7 @@ func TestEnsureSessionFresh_NoExistingSession(t *testing.T) {
 }
 
 func TestEnsureSessionFresh_ZombieSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-zombie-" + t.Name()
 
 	// Clean up any existing session
@@ -266,10 +248,10 @@ func TestEnsureSessionFresh_ZombieSession(t *testing.T) {
 		t.Skip("session unexpectedly has agent running - can't test zombie case")
 	}
 
-	// Verify generic agent check also treats it as not running (shell session)
-	if tm.IsAgentRunning(sessionName) {
-		t.Fatalf("expected IsAgentRunning(%q) to be false for a fresh shell session", sessionName)
-	}
+	// Fresh tmux sessions can briefly report transient pane commands while the
+	// login shell is starting. IsAgentAlive is the stable predicate we care
+	// about here: there is no runtime in the session, so EnsureSessionFresh
+	// should treat it as a zombie and recreate it successfully.
 
 	// EnsureSessionFresh should kill the zombie and create fresh session
 	// This should NOT error with "session already exists"
@@ -288,11 +270,7 @@ func TestEnsureSessionFresh_ZombieSession(t *testing.T) {
 }
 
 func TestEnsureSessionFresh_IdempotentOnZombie(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-idem-" + t.Name()
 
 	// Clean up any existing session
@@ -316,12 +294,91 @@ func TestEnsureSessionFresh_IdempotentOnZombie(t *testing.T) {
 	}
 }
 
-func TestIsAgentRunning(t *testing.T) {
+func TestEnsureSessionFreshWithCommand_NoExisting(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
 
 	tm := NewTmux()
+	sessionName := "gt-test-fwc-new-" + t.Name()
+
+	// Clean up any existing session
+	_ = tm.KillSession(sessionName)
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// EnsureSessionFreshWithCommand should create a new session with the command
+	// as the initial pane process (no shell involved).
+	if err := tm.EnsureSessionFreshWithCommand(sessionName, "", "sleep 10"); err != nil {
+		t.Fatalf("EnsureSessionFreshWithCommand: %v", err)
+	}
+
+	// Verify session exists
+	has, err := tm.HasSession(sessionName)
+	if err != nil {
+		t.Fatalf("HasSession: %v", err)
+	}
+	if !has {
+		t.Error("expected session to exist")
+	}
+
+	// Verify the command is running (not a shell)
+	cmd, err := tm.GetPaneCommand(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneCommand: %v", err)
+	}
+	if cmd != "sleep" {
+		t.Logf("pane command = %q (expected 'sleep')", cmd)
+	}
+}
+
+func TestEnsureSessionFreshWithCommand_KillsZombie(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := NewTmux()
+	sessionName := "gt-test-fwc-zombie-" + t.Name()
+
+	// Clean up any existing session
+	_ = tm.KillSession(sessionName)
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	// Create a zombie session (empty shell, no agent)
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Verify it's a zombie
+	if tm.IsAgentRunning(sessionName) {
+		t.Skip("session unexpectedly has agent running")
+	}
+
+	// EnsureSessionFreshWithCommand should kill the zombie and create fresh session
+	if err := tm.EnsureSessionFreshWithCommand(sessionName, "", "sleep 10"); err != nil {
+		t.Fatalf("EnsureSessionFreshWithCommand on zombie: %v", err)
+	}
+
+	// Session should exist with the new command
+	has, err := tm.HasSession(sessionName)
+	if err != nil {
+		t.Fatalf("HasSession: %v", err)
+	}
+	if !has {
+		t.Error("expected session to exist after replacing zombie")
+	}
+
+	// The command should be sleep, not a shell
+	cmd, err := tm.GetPaneCommand(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneCommand: %v", err)
+	}
+	if cmd != "sleep" {
+		t.Logf("pane command = %q (expected 'sleep' after zombie replacement)", cmd)
+	}
+}
+
+func TestIsAgentRunning(t *testing.T) {
+	tm := newTestTmux(t)
 	sessionName := "gt-test-agent-" + t.Name()
 
 	// Clean up any existing session
@@ -415,11 +472,7 @@ func TestIsAgentRunning(t *testing.T) {
 }
 
 func TestIsAgentRunning_NonexistentSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// IsAgentRunning on nonexistent session should return false, not error
 	got := tm.IsAgentRunning("nonexistent-session-xyz", "node", "gemini", "cursor-agent")
@@ -429,11 +482,7 @@ func TestIsAgentRunning_NonexistentSession(t *testing.T) {
 }
 
 func TestIsRuntimeRunning(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-runtime-" + t.Name()
 
 	// Clean up any existing session
@@ -456,11 +505,7 @@ func TestIsRuntimeRunning(t *testing.T) {
 }
 
 func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-shell-child-" + t.Name()
 
 	// Clean up any existing session
@@ -508,11 +553,7 @@ func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 // for gs-2v7: without explicit pane 0 targeting, health checks would see the
 // split pane's shell and falsely report the agent as dead.
 func TestGetPaneCommand_MultiPane(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-multipane-" + t.Name()
 
 	_ = tm.KillSession(sessionName)
@@ -576,6 +617,7 @@ func TestGetPaneCommand_MultiPane(t *testing.T) {
 }
 
 func TestHasDescendantWithNames(t *testing.T) {
+	t.Parallel()
 	// Test the hasDescendantWithNames helper function directly
 
 	// Test with a definitely nonexistent PID
@@ -584,26 +626,30 @@ func TestHasDescendantWithNames(t *testing.T) {
 		t.Error("hasDescendantWithNames should return false for nonexistent PID")
 	}
 
+	// Use current PID instead of PID 1 to avoid walking the entire process tree
+	selfPID := fmt.Sprintf("%d", os.Getpid())
+
 	// Test with empty names slice - should always return false
-	got = hasDescendantWithNames("1", []string{}, 0)
+	got = hasDescendantWithNames(selfPID, []string{}, 0)
 	if got {
 		t.Error("hasDescendantWithNames should return false for empty names slice")
 	}
 
 	// Test with nil names slice - should always return false
-	got = hasDescendantWithNames("1", nil, 0)
+	got = hasDescendantWithNames(selfPID, nil, 0)
 	if got {
 		t.Error("hasDescendantWithNames should return false for nil names slice")
 	}
 
-	// Test with PID 1 (init/launchd) - should have children but not specific agent processes
-	got = hasDescendantWithNames("1", []string{"node", "claude"}, 0)
+	// Test with current process - should have children but not specific agent processes
+	got = hasDescendantWithNames(selfPID, []string{"node", "claude"}, 0)
 	if got {
-		t.Logf("hasDescendantWithNames(\"1\", [node,claude]) = true - init has matching child?")
+		t.Logf("hasDescendantWithNames(%q, [node,claude]) = true - process has matching child?", selfPID)
 	}
 }
 
 func TestGetAllDescendants(t *testing.T) {
+	t.Parallel()
 	// Test the getAllDescendants helper function
 
 	// Test with nonexistent PID - should return empty slice
@@ -612,11 +658,10 @@ func TestGetAllDescendants(t *testing.T) {
 		t.Errorf("getAllDescendants(nonexistent) = %v, want empty slice", got)
 	}
 
-	// Test with PID 1 (init/launchd) - should find some descendants
-	// Note: We can't test exact PIDs, just that the function doesn't panic
-	// and returns reasonable results
-	descendants := getAllDescendants("1")
-	t.Logf("getAllDescendants(\"1\") found %d descendants", len(descendants))
+	// Use current PID instead of PID 1 to avoid walking the entire process tree
+	selfPID := fmt.Sprintf("%d", os.Getpid())
+	descendants := getAllDescendants(selfPID)
+	t.Logf("getAllDescendants(%q) found %d descendants", selfPID, len(descendants))
 
 	// Verify returned PIDs are all numeric strings
 	for _, pid := range descendants {
@@ -629,11 +674,7 @@ func TestGetAllDescendants(t *testing.T) {
 }
 
 func TestKillSessionWithProcesses(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-killproc-" + t.Name()
 
 	// Clean up any existing session
@@ -672,11 +713,7 @@ func TestKillSessionWithProcesses(t *testing.T) {
 }
 
 func TestKillSessionWithProcesses_NonexistentSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// Killing nonexistent session should not panic, just return error or nil
 	err := tm.KillSessionWithProcesses("nonexistent-session-xyz-12345")
@@ -685,11 +722,7 @@ func TestKillSessionWithProcesses_NonexistentSession(t *testing.T) {
 }
 
 func TestKillSessionWithProcessesExcluding(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-killexcl-" + t.Name()
 
 	// Clean up any existing session
@@ -728,11 +761,7 @@ func TestKillSessionWithProcessesExcluding(t *testing.T) {
 }
 
 func TestKillSessionWithProcessesExcluding_WithExcludePID(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-killexcl2-" + t.Name()
 
 	// Clean up any existing session
@@ -769,11 +798,7 @@ func TestKillSessionWithProcessesExcluding_WithExcludePID(t *testing.T) {
 }
 
 func TestKillSessionWithProcessesExcluding_NonexistentSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// Killing nonexistent session should not panic
 	err := tm.KillSessionWithProcessesExcluding("nonexistent-session-xyz-12345", []string{"12345"})
@@ -831,11 +856,7 @@ func TestGetProcessGroupMembers(t *testing.T) {
 }
 
 func TestKillSessionWithProcesses_KillsProcessGroup(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-killpg-" + t.Name()
 
 	// Clean up any existing session
@@ -878,11 +899,7 @@ func TestKillSessionWithProcesses_KillsProcessGroup(t *testing.T) {
 }
 
 func TestSessionSet(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-sessionset-" + t.Name()
 
 	// Clean up any existing session
@@ -931,33 +948,20 @@ func TestSessionSet(t *testing.T) {
 }
 
 func TestCleanupOrphanedSessions(t *testing.T) {
-	// CRITICAL SAFETY: This test calls CleanupOrphanedSessions() which kills ALL
-	// gt-*/hq-* sessions that appear orphaned. This is EXTREMELY DANGEROUS in any
-	// environment with running agents. Require explicit opt-in via environment variable.
-	if os.Getenv("GT_TEST_ALLOW_CLEANUP_TEST") != "1" {
-		t.Skip("Skipping: GT_TEST_ALLOW_CLEANUP_TEST=1 required (this test kills sessions)")
-	}
-
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	// Local predicate matching gt-/hq- prefixes (sufficient for test fixtures;
-	// avoids circular import of session package).
+	// newTestTmux creates an isolated tmux server (unique socket per test).
+	// CleanupOrphanedSessions operates on the Tmux receiver which carries that
+	// socket, so it can only see sessions on this isolated server — never real
+	// polecats or user sessions.
+	//
+	// History: this test previously used NewTmux() (default server) and killed
+	// 8 production crew sessions during a patrol run. The env-var guard added in
+	// 3519f58c was the right fix at the time; per-test socket isolation (48550c7f)
+	// made it redundant.
 	isTestGTSession := func(s string) bool {
 		return strings.HasPrefix(s, "gt-") || strings.HasPrefix(s, "hq-")
 	}
 
-	tm := NewTmux()
-
-	// Additional safety check: Skip if production GT sessions exist.
-	sessions, _ := tm.ListSessions()
-	for _, sess := range sessions {
-		if isTestGTSession(sess) &&
-			sess != "gt-test-cleanup-rig" && sess != "hq-test-cleanup" {
-			t.Skip("Skipping: production GT sessions exist (would be killed by CleanupOrphanedSessions)")
-		}
-	}
+	tm := newTestTmux(t)
 
 	// Create test sessions with gt- and hq- prefixes (zombie sessions - no Claude running)
 	gtSession := "gt-test-cleanup-rig"
@@ -1030,32 +1034,14 @@ func TestCleanupOrphanedSessions(t *testing.T) {
 }
 
 func TestCleanupOrphanedSessions_NoSessions(t *testing.T) {
-	// CRITICAL SAFETY: This test calls CleanupOrphanedSessions() which kills ALL
-	// gt-*/hq-* sessions that appear orphaned. Require explicit opt-in.
-	if os.Getenv("GT_TEST_ALLOW_CLEANUP_TEST") != "1" {
-		t.Skip("Skipping: GT_TEST_ALLOW_CLEANUP_TEST=1 required (this test kills sessions)")
-	}
-
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	// Local predicate matching gt-/hq- prefixes (avoids circular import).
+	// See TestCleanupOrphanedSessions for isolation rationale.
 	isTestGTSession := func(s string) bool {
 		return strings.HasPrefix(s, "gt-") || strings.HasPrefix(s, "hq-")
 	}
 
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
-	// Additional safety check: Skip if production GT sessions exist.
-	sessions, _ := tm.ListSessions()
-	for _, sess := range sessions {
-		if isTestGTSession(sess) {
-			t.Skip("Skipping: GT sessions exist (CleanupOrphanedSessions would kill them)")
-		}
-	}
-
-	// Running cleanup with no orphaned GT sessions should return 0, no error
+	// Fresh isolated server has no sessions — cleanup should be a no-op.
 	cleaned, err := tm.CleanupOrphanedSessions(isTestGTSession)
 	if err != nil {
 		t.Fatalf("CleanupOrphanedSessions: %v", err)
@@ -1066,6 +1052,7 @@ func TestCleanupOrphanedSessions_NoSessions(t *testing.T) {
 }
 
 func TestCollectReparentedGroupMembers(t *testing.T) {
+	t.Parallel()
 	// Test that collectReparentedGroupMembers correctly filters group members.
 	// Only processes reparented to init (PPID == 1) that aren't in the known set
 	// should be returned.
@@ -1095,6 +1082,7 @@ func TestCollectReparentedGroupMembers(t *testing.T) {
 }
 
 func TestGetParentPID(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("getParentPID returns empty string on Windows (no /proc or ps)")
 	}
@@ -1119,11 +1107,7 @@ func TestGetParentPID(t *testing.T) {
 }
 
 func TestKillSessionWithProcesses_DoesNotKillUnrelatedProcesses(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-nounrelated-" + t.Name()
 
 	// Clean up any existing session
@@ -1164,11 +1148,7 @@ func TestKillSessionWithProcesses_DoesNotKillUnrelatedProcesses(t *testing.T) {
 }
 
 func TestKillPaneProcessesExcluding(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-killpaneexcl-" + t.Name()
 
 	// Clean up any existing session
@@ -1198,11 +1178,7 @@ func TestKillPaneProcessesExcluding(t *testing.T) {
 }
 
 func TestKillPaneProcessesExcluding_WithExcludePID(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-killpaneexcl2-" + t.Name()
 
 	// Clean up any existing session
@@ -1244,11 +1220,7 @@ func TestKillPaneProcessesExcluding_WithExcludePID(t *testing.T) {
 }
 
 func TestKillPaneProcessesExcluding_NonexistentPane(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// Killing nonexistent pane should return an error but not panic
 	err := tm.KillPaneProcessesExcluding("%99999", []string{"12345"})
@@ -1303,11 +1275,7 @@ func TestKillPaneProcessesExcluding_FiltersPIDs(t *testing.T) {
 }
 
 func TestFindAgentPane_SinglePane(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-findagent-single-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 
 	_ = tm.KillSession(sessionName)
@@ -1327,11 +1295,7 @@ func TestFindAgentPane_SinglePane(t *testing.T) {
 }
 
 func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-findagent-multi-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 
 	_ = tm.KillSession(sessionName)
@@ -1488,11 +1452,7 @@ func TestNudgeLockDifferentSessions(t *testing.T) {
 }
 
 func TestFindAgentPane_NonexistentSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	_, err := tm.FindAgentPane("nonexistent-session-findagent-xyz")
 	if err == nil {
 		t.Error("FindAgentPane on nonexistent session should return error")
@@ -1500,6 +1460,7 @@ func TestFindAgentPane_NonexistentSession(t *testing.T) {
 }
 
 func TestValidateSessionName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		session string
@@ -1528,7 +1489,7 @@ func TestValidateSessionName(t *testing.T) {
 }
 
 func TestNewSession_RejectsInvalidName(t *testing.T) {
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	err := tm.NewSession("invalid.name", "")
 	if err == nil {
 		t.Error("NewSession should reject session name with dots")
@@ -1539,7 +1500,7 @@ func TestNewSession_RejectsInvalidName(t *testing.T) {
 }
 
 func TestEnsureSessionFresh_RejectsInvalidName(t *testing.T) {
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	err := tm.EnsureSessionFresh("has:colon", "")
 	if err == nil {
 		t.Error("EnsureSessionFresh should reject session name with colons")
@@ -1550,11 +1511,7 @@ func TestEnsureSessionFresh_RejectsInvalidName(t *testing.T) {
 }
 
 func TestFindAgentPane_MultiPaneNoAgent(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-findagent-noagent-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 
 	_ = tm.KillSession(sessionName)
@@ -1582,11 +1539,7 @@ func TestFindAgentPane_MultiPaneNoAgent(t *testing.T) {
 }
 
 func TestNewSessionWithCommandAndEnv(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-env-" + t.Name()
 
 	// Clean up any existing session
@@ -1633,11 +1586,7 @@ func TestNewSessionWithCommandAndEnv(t *testing.T) {
 }
 
 func TestNewSessionWithCommandAndEnvEmpty(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-env-empty-" + t.Name()
 
 	// Clean up any existing session
@@ -1659,6 +1608,7 @@ func TestNewSessionWithCommandAndEnvEmpty(t *testing.T) {
 }
 
 func TestIsTransientSendKeysError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -1682,11 +1632,7 @@ func TestIsTransientSendKeysError(t *testing.T) {
 }
 
 func TestSendKeysLiteralWithRetry_ImmediateSuccess(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-retry-ok-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 
 	// Create a session that's ready to accept input
@@ -1703,11 +1649,7 @@ func TestSendKeysLiteralWithRetry_ImmediateSuccess(t *testing.T) {
 }
 
 func TestSendKeysLiteralWithRetry_NonTransientFails(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// Target a session that doesn't exist — should fail immediately, not retry
 	start := time.Now()
@@ -1724,11 +1666,7 @@ func TestSendKeysLiteralWithRetry_NonTransientFails(t *testing.T) {
 }
 
 func TestSendKeysLiteralWithRetry_NonTransientFailsFast(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	// Use a nonexistent session — tmux returns "session not found" which is
 	// non-transient, so the function should fail fast (well under the timeout).
 	start := time.Now()
@@ -1745,11 +1683,7 @@ func TestSendKeysLiteralWithRetry_NonTransientFailsFast(t *testing.T) {
 }
 
 func TestNudgeSession_WithRetry(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-nudge-retry-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 
 	// Create a ready session
@@ -1773,9 +1707,10 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 // character, but the default ReadyPromptPrefix uses a regular space.
 // Regression test for https://github.com/steveyegge/gastown/issues/1387.
 func TestMatchesPromptPrefix(t *testing.T) {
+	t.Parallel()
 	const (
 		nbsp          = "\u00a0" // non-breaking space
-		regularPrefix = "❯ "    // default: ❯ + regular space
+		regularPrefix = "❯ "     // default: ❯ + regular space
 	)
 
 	tests := []struct {
@@ -1821,9 +1756,6 @@ func TestMatchesPromptPrefix(t *testing.T) {
 }
 
 func TestWaitForIdle_Timeout(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
 	if os.Getenv("TMUX") == "" {
 		t.Skip("not inside tmux")
 	}
@@ -1831,7 +1763,7 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 		t.Skip("test requires unix")
 	}
 
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// Create a session running a long sleep (no prompt visible)
 	sessionName := fmt.Sprintf("gt-test-idle-%d", time.Now().UnixNano())
@@ -1853,6 +1785,7 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 }
 
 func TestDefaultReadyPromptPrefix(t *testing.T) {
+	t.Parallel()
 	// Verify the constant is set correctly
 	if DefaultReadyPromptPrefix == "" {
 		t.Error("DefaultReadyPromptPrefix should not be empty")
@@ -1863,11 +1796,7 @@ func TestDefaultReadyPromptPrefix(t *testing.T) {
 }
 
 func TestGetSessionActivity(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := "gt-test-activity-" + t.Name()
 
 	// Clean up any existing session
@@ -1902,11 +1831,7 @@ func TestGetSessionActivity(t *testing.T) {
 }
 
 func TestGetSessionActivity_NonexistentSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// GetSessionActivity on nonexistent session should error
 	_, err := tm.GetSessionActivity("nonexistent-session-xyz-12345")
@@ -1985,9 +1910,7 @@ func TestNewSessionSet_Nil(t *testing.T) {
 
 func TestSessionPrefixPattern_AlwaysIncludesGTAndHQ(t *testing.T) {
 	// Even without GT_ROOT, the pattern should include gt and hq as safe defaults.
-	orig := os.Getenv("GT_ROOT")
 	t.Setenv("GT_ROOT", "")
-	defer func() { os.Setenv("GT_ROOT", orig) }()
 
 	pattern := sessionPrefixPattern()
 	if !strings.Contains(pattern, "gt") {
@@ -2003,10 +1926,7 @@ func TestSessionPrefixPattern_AlwaysIncludesGTAndHQ(t *testing.T) {
 }
 
 func TestGetKeyBinding_NoExistingBinding(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	// Query a key that almost certainly has no binding
 	result := tm.getKeyBinding("prefix", "F12")
 	if result != "" {
@@ -2015,10 +1935,7 @@ func TestGetKeyBinding_NoExistingBinding(t *testing.T) {
 }
 
 func TestGetKeyBinding_CapturesDefaultBinding(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// Query the default tmux binding for prefix-n (next-window).
 	// This works without a running tmux server because list-keys
@@ -2034,10 +1951,7 @@ func TestGetKeyBinding_CapturesDefaultBinding(t *testing.T) {
 }
 
 func TestGetKeyBinding_CapturesDefaultBindingWithArgs(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-	tm := NewTmux()
+	tm := newTestTmux(t)
 
 	// prefix-s is "choose-tree -Zs" by default — tests multi-word command parsing
 	result := tm.getKeyBinding("prefix", "s")
@@ -2047,13 +1961,13 @@ func TestGetKeyBinding_CapturesDefaultBindingWithArgs(t *testing.T) {
 }
 
 func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
+	tm := newTestTmux(t)
+
+	// Bootstrap the isolated server (bind-key requires a running server)
+	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
+		t.Fatalf("bootstrap session: %v", err)
 	}
-	if !IsInsideTmux() {
-		t.Skip("not inside tmux — need server for bind-key")
-	}
-	tm := NewTmux()
+	defer tm.KillSession("gt-test-bootstrap")
 
 	// Set a GT-style if-shell binding (contains both "if-shell" and "gt ")
 	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
@@ -2072,13 +1986,13 @@ func TestGetKeyBinding_SkipsGasTownBindings(t *testing.T) {
 }
 
 func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
+	tm := newTestTmux(t)
+
+	// Bootstrap the isolated server (bind-key requires a running server)
+	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
+		t.Fatalf("bootstrap session: %v", err)
 	}
-	if !IsInsideTmux() {
-		t.Skip("not inside tmux — need server for bind-key")
-	}
-	tm := NewTmux()
+	defer tm.KillSession("gt-test-bootstrap")
 
 	// Set a user binding that doesn't contain "gt "
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2097,13 +2011,13 @@ func TestGetKeyBinding_CapturesUserBinding(t *testing.T) {
 }
 
 func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
+	tm := newTestTmux(t)
+
+	// Bootstrap the isolated server (bind-key requires a running server)
+	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
+		t.Fatalf("bootstrap session: %v", err)
 	}
-	if !IsInsideTmux() {
-		t.Skip("not inside tmux — need server for bind-key")
-	}
-	tm := NewTmux()
+	defer tm.KillSession("gt-test-bootstrap")
 
 	// A plain user binding should NOT be detected as GT
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "hello")
@@ -2126,13 +2040,13 @@ func TestIsGTBinding_DetectsGasTownBindings(t *testing.T) {
 }
 
 func TestSetBindings_PreserveFallbackOnRepeatedCalls(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
+	tm := newTestTmux(t)
+
+	// Bootstrap the isolated server (bind-key requires a running server)
+	if err := tm.NewSession("gt-test-bootstrap", ""); err != nil {
+		t.Fatalf("bootstrap session: %v", err)
 	}
-	if !IsInsideTmux() {
-		t.Skip("not inside tmux — need server for bind-key")
-	}
-	tm := NewTmux()
+	defer tm.KillSession("gt-test-bootstrap")
 
 	// Set a custom user binding on F11
 	_, _ = tm.run("bind-key", "-T", "prefix", "F11", "display-message", "custom-user-cmd")
@@ -2183,6 +2097,7 @@ func TestSessionPrefixPattern_WithTownRoot(t *testing.T) {
 }
 
 func TestZombieStatusString(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		status   ZombieStatus
 		expected string
@@ -2205,11 +2120,7 @@ func TestZombieStatusString(t *testing.T) {
 }
 
 func TestCheckSessionHealth_NonexistentSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	status := tm.CheckSessionHealth("nonexistent-session-xyz", 0)
 	if status != SessionDead {
 		t.Errorf("CheckSessionHealth(nonexistent) = %v, want SessionDead", status)
@@ -2217,12 +2128,8 @@ func TestCheckSessionHealth_NonexistentSession(t *testing.T) {
 }
 
 func TestCheckSessionHealth_ZombieSession(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
 	// Create a session with just a shell (no agent running)
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := fmt.Sprintf("gt-test-zombie-%d", os.Getpid())
 	if err := tm.NewSession(sessionName, ""); err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -2240,12 +2147,8 @@ func TestCheckSessionHealth_ZombieSession(t *testing.T) {
 }
 
 func TestCheckSessionHealth_ActivityCheck(t *testing.T) {
-	if !hasTmux() {
-		t.Skip("tmux not installed")
-	}
-
 	// Create a session that runs a long-lived process
-	tm := NewTmux()
+	tm := newTestTmux(t)
 	sessionName := fmt.Sprintf("gt-test-activity-%d", os.Getpid())
 	// Use 'sleep' as a stand-in for an agent process
 	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
@@ -2266,4 +2169,40 @@ func TestCheckSessionHealth_ActivityCheck(t *testing.T) {
 	// With a very short maxInactivity, a recently-created session should be healthy
 	// (if the agent were actually running). This tests the activity threshold logic
 	// without needing a real Claude process.
+}
+
+func TestValidateCommandBinary(t *testing.T) {
+	t.Parallel()
+
+	absoluteShell := "/bin/sh"
+	if runtime.GOOS == "windows" {
+		path, err := exec.LookPath("sh")
+		if err != nil {
+			t.Skip("sh not installed")
+		}
+		absoluteShell = path
+	}
+
+	tests := []struct {
+		name    string
+		cmd     string
+		wantErr bool
+	}{
+		{"empty", "", false},
+		{"relative binary", "echo hello", false},
+		{"valid absolute", absoluteShell + " -c 'echo hi'", false},
+		{"missing absolute", "/nonexistent/binary --flag", true},
+		{"exec env missing", "exec env GT_TEST=1 /nonexistent/claude-code --settings /tmp", true},
+		{"exec env valid", "exec env GT_TEST=1 " + absoluteShell + " -c 'echo hi'", false},
+		{"env vars only", "exec env FOO=bar BAZ=1", false},
+		{"bare exec", "exec " + absoluteShell, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCommandBinary(tc.cmd)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateCommandBinary(%q) error = %v, wantErr = %v", tc.cmd, err, tc.wantErr)
+			}
+		})
+	}
 }

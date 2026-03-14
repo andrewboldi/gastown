@@ -19,6 +19,26 @@ Polecats have four operating states:
 | **Stalled** | Session stopped mid-work | Interrupted, crashed, or timed out without being nudged |
 | **Zombie** | Completed work but failed to exit | `gt done` failed during cleanup |
 
+**State cycle (happy path):**
+
+```
+         ┌──────────┐
+    ┌───>│  IDLE    │<──── sync sandbox to main, clear hook
+    │    └────┬─────┘
+    │         │ gt sling
+    │         v
+    │    ┌──────────┐
+    │    │ WORKING  │<──── session active, hook set
+    │    └────┬─────┘
+    │         │ gt done
+    │         v
+    │    ┌──────────┐
+    └────┤  IDLE    │──── push branch, submit MR, go idle
+         └──────────┘
+```
+
+No `nuke` in the happy path. Polecats cycle: IDLE -> WORKING -> IDLE.
+
 **Key distinctions:**
 
 - **Working** = actively executing. Session alive, hook set, doing work.
@@ -56,6 +76,22 @@ The Refinery owns the merge queue. Once `gt done` submits work:
 - The idle polecat can be reused for the conflict resolution work
 
 ## The Three Layers
+
+### The Problem: Three Concepts Were Conflated
+
+Early designs treated polecats as monolithic. This caused recurring issues:
+
+| Concept | Lifecycle | Old behavior |
+|---------|-----------|-----------------|
+| **Identity** | Long-lived (name, CV, ledger) | Destroyed on nuke |
+| **Sandbox** | Per-assignment (worktree, branch) | Destroyed on nuke |
+| **Session** | Ephemeral (Claude context window) | = polecat lifetime |
+
+Separating these three layers means idle polecats are a healthy state (not waste),
+eliminates unnecessary worktree creation overhead, and preserves capability
+records (CV, completion history) across assignments.
+
+### Layer Summary
 
 | Layer | Component | Lifecycle | Persistence |
 |-------|-----------|-----------|-------------|
@@ -110,6 +146,28 @@ This worktree:
 - Contains uncommitted work, staged changes, branch state during active work
 
 The Witness never destroys sandboxes. Only explicit `gt polecat nuke` removes them.
+
+#### Sandbox Sync (Between Assignments)
+
+When work completes and the polecat goes idle, the sandbox is synced to main:
+
+```bash
+# In the polecat's worktree (done automatically by gt done / gt sling)
+git checkout main
+git pull origin main
+git branch -D polecat/<name>/<old-issue>@<timestamp>
+# Worktree is now clean, on main, ready for next assignment
+```
+
+When new work is slung:
+```bash
+# Create fresh branch from current main
+git checkout -b polecat/<name>/<new-issue>@<timestamp>
+# Start working
+```
+
+No worktree add/remove between assignments. Just branch operations on an
+existing worktree. This avoids the ~5s overhead of creating fresh worktrees.
 
 ### Slot Layer
 
@@ -300,8 +358,24 @@ This distinction matters for:
 - **Cost accounting** - Who pays for inference?
 - **Federation** - Agents having their own chains in a distributed world
 
+## Implementation Status
+
+As of 2026-03-07 (gt-o8g8 audit), all core lifecycle operations are **shipped and
+running in production**. See [design/polecat-lifecycle-patrol.md § 10](../design/polecat-lifecycle-patrol.md#10-implementation-status-gt-o8g8-audit-2026-03-07)
+for the full implementation matrix and [design/persistent-polecat-pool.md](../design/persistent-polecat-pool.md)
+for phase-by-phase shipping status.
+
+Key files:
+- `internal/cmd/done.go` — work submission, sandbox sync, idle transition
+- `internal/cmd/sling.go` + `polecat_spawn.go` — idle reuse, branch-only repair
+- `internal/cmd/handoff.go` — session cycling for all roles
+- `internal/witness/handlers.go` — cleanup pipeline, POLECAT_DONE routing, zombie/orphan detection
+- `internal/polecat/manager.go` — stale detection, idle reuse (`FindIdlePolecat`, `ReuseIdlePolecat`), pool management
+
 ## Related Documentation
 
 - [Overview](../overview.md) - Role taxonomy and architecture
 - [Molecules](molecules.md) - Molecule execution and polecat workflow
 - [Propulsion Principle](propulsion-principle.md) - Why work triggers immediate execution
+- [Polecat Lifecycle Patrol](../design/polecat-lifecycle-patrol.md) - Implementation details, cleanup stages, patrol coordination
+- [Persistent Polecat Pool](../design/persistent-polecat-pool.md) - Pool management design and shipping status

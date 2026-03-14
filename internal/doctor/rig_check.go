@@ -111,7 +111,7 @@ func NewGitExcludeConfiguredCheck() *GitExcludeConfiguredCheck {
 
 // requiredExcludes returns the directories that should be excluded.
 func (c *GitExcludeConfiguredCheck) requiredExcludes() []string {
-	return []string{"polecats/", "witness/", "refinery/", "mayor/"}
+	return []string{"/polecats/", "/witness/", "/refinery/", "/mayor/"}
 }
 
 // Run checks if .git/info/exclude contains required entries.
@@ -174,10 +174,13 @@ func (c *GitExcludeConfiguredCheck) Run(ctx *CheckContext) *CheckResult {
 		_ = file.Close() //nolint:gosec // G104: best-effort close
 	}
 
-	// Check for missing entries
+	// Check for missing entries. Accept either anchored (/refinery/) or
+	// legacy un-anchored (refinery/) forms — the un-anchored form is overly
+	// broad but still covers the required directory.
 	c.missingEntries = nil
 	for _, required := range c.requiredExcludes() {
-		if !existing[required] {
+		unanchored := strings.TrimPrefix(required, "/")
+		if !existing[required] && !existing[unanchored] {
 			c.missingEntries = append(c.missingEntries, required)
 		}
 	}
@@ -567,9 +570,38 @@ func (c *RefineryExistsCheck) Fix(ctx *CheckContext) error {
 		}
 	}
 
-	// Note: Cannot auto-fix clone without knowing the repo URL
+	// Auto-repair refinery worktree from shared bare repo (.repo.git).
+	// The refinery/rig is a worktree (not a full clone), so we don't need
+	// the repo URL -- we just create a worktree from the local bare repo.
 	if c.needsClone {
-		return fmt.Errorf("cannot auto-create refinery/rig/ clone (requires repo URL)")
+		bareRepoPath := filepath.Join(c.rigPath, ".repo.git")
+		if _, err := os.Stat(bareRepoPath); os.IsNotExist(err) {
+			return fmt.Errorf("cannot auto-create refinery/rig/ worktree: bare repo not found at %s", bareRepoPath)
+		}
+
+		bareGit := git.NewGitWithDir(bareRepoPath, "")
+		_ = bareGit.WorktreePrune()
+
+		rigClone := filepath.Join(refineryDir, "rig")
+		// Detect default branch from rig config
+		rigCfgPath := filepath.Join(c.rigPath, "settings", "rig.json")
+		defaultBranch := "main"
+		if data, err := os.ReadFile(rigCfgPath); err == nil {
+			var cfg struct {
+				DefaultBranch string `json:"default_branch"`
+			}
+			if json.Unmarshal(data, &cfg) == nil && cfg.DefaultBranch != "" {
+				defaultBranch = cfg.DefaultBranch
+			}
+		}
+
+		if err := bareGit.WorktreeAddExisting(rigClone, defaultBranch); err != nil {
+			return fmt.Errorf("creating refinery worktree from bare repo: %w", err)
+		}
+
+		// Configure hooks path
+		refineryGit := git.NewGit(rigClone)
+		_ = refineryGit.ConfigureHooksPath()
 	}
 
 	return nil
@@ -1067,11 +1099,11 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
-// hasBeadsData checks if a beads directory has actual data (issues.jsonl, issues.db, config.yaml)
+// hasBeadsData checks if a beads directory has actual data (issues.db, config.yaml)
 // as opposed to just being a redirect-only directory.
 func hasBeadsData(beadsDir string) bool {
-	// Check for actual beads data files
-	dataFiles := []string{"issues.jsonl", "issues.db", "config.yaml"}
+	// Check for actual beads data files (Dolt-only — issues.jsonl is no longer supported)
+	dataFiles := []string{"issues.db", "config.yaml"}
 	for _, f := range dataFiles {
 		if _, err := os.Stat(filepath.Join(beadsDir, f)); err == nil {
 			return true
@@ -1826,5 +1858,6 @@ func RigChecks() []Check {
 		NewPolecatClonesValidCheck(),
 		NewBeadsConfigValidCheck(),
 		NewBeadsRedirectCheck(),
+		NewTestutilSymlinkCheck(),
 	}
 }

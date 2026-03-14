@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -35,7 +38,10 @@ automated agents. When in doubt, escalate to the Mayor.
 Role shortcuts: "mayor" in mail/nudge addresses resolves to this agent.`,
 }
 
-var mayorAgentOverride string
+var (
+	mayorAgentOverride string
+	mayorStatusRunning bool
+)
 
 var mayorStartCmd = &cobra.Command{
 	Use:   "start",
@@ -83,16 +89,48 @@ Stops the current session (if running) and starts a fresh one.`,
 	RunE: runMayorRestart,
 }
 
+var mayorAcpCmd = &cobra.Command{
+	Use:   "acp",
+	Short: "Run Mayor in headless mode (Agent Control Protocol)",
+	Long: `Run the Mayor in headless mode with stdin/stdout connected.
+
+This command initializes a headless session without tmux, designed for
+IDE integration via the Agent Control Protocol. It bypasses all tmux
+logic and runs directly in the current terminal.
+
+Environment variable overrides:
+  GT_RIG          - Override rig name
+  GT_TOWN_ROOT    - Override town root directory
+  GT_ROLE         - Override role (default: mayor)
+
+The agent reads prompts from stdin and outputs to stdout. This enables
+programmatic control by IDEs or other tools that need direct agent access.
+
+While an ACP session is active, automatic cleanup of polecat workspaces
+is vetoed to allow the Mayor to review worker diffs before they vanish.`,
+	RunE: runMayorAcp,
+}
+
+var acpRigOverride string
+var acpTownRootOverride string
+
 func init() {
 	mayorCmd.AddCommand(mayorStartCmd)
 	mayorCmd.AddCommand(mayorStopCmd)
 	mayorCmd.AddCommand(mayorAttachCmd)
 	mayorCmd.AddCommand(mayorStatusCmd)
 	mayorCmd.AddCommand(mayorRestartCmd)
+	mayorCmd.AddCommand(mayorAcpCmd)
+
+	mayorStatusCmd.Flags().BoolVar(&mayorStatusRunning, "running", false, "Output only true/false for running status")
 
 	mayorStartCmd.Flags().StringVar(&mayorAgentOverride, "agent", "", "Agent alias to run the Mayor with (overrides town default)")
 	mayorAttachCmd.Flags().StringVar(&mayorAgentOverride, "agent", "", "Agent alias to run the Mayor with (overrides town default)")
 	mayorRestartCmd.Flags().StringVar(&mayorAgentOverride, "agent", "", "Agent alias to run the Mayor with (overrides town default)")
+
+	mayorAcpCmd.Flags().StringVar(&acpRigOverride, "rig", "", "Rig name (overrides GT_RIG env)")
+	mayorAcpCmd.Flags().StringVar(&acpTownRootOverride, "town", "", "Town root directory (overrides GT_TOWN_ROOT env)")
+	mayorAcpCmd.Flags().StringVar(&mayorAgentOverride, "agent", "", "Agent alias to run (overrides town default)")
 
 	rootCmd.AddCommand(mayorCmd)
 }
@@ -161,8 +199,19 @@ func runMayorAttach(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("finding workspace: %w", err)
 	}
 
+	// Check if ACP is active and gracefully shut it down before switching to tmux.
+	// Only 'gt mayor attach' is allowed to transition from ACP to tmux mode.
+	if mayor.IsACPActive(townRoot) {
+		fmt.Fprintf(os.Stderr, "ACP Mayor is active. Switching to tmux mode...\n")
+		if err := gracefullyShutdownACP(townRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not gracefully shutdown ACP: %v\n", err)
+		}
+	}
+
 	// Ensure daemon and dolt are running before attaching.
-	ensureMayorInfra(townRoot)
+	if err := ensureMayorInfra(townRoot); err != nil {
+		return err
+	}
 
 	t := tmux.NewTmux()
 	sessionID := mgr.SessionName()
@@ -230,34 +279,96 @@ func runMayorAttach(cmd *cobra.Command, args []string) error {
 	return attachToTmuxSession(sessionID)
 }
 
+// gracefullyShutdownACP removes the PID file to signal the ACP proxy to exit,
+// then waits for the process to terminate.
+func gracefullyShutdownACP(townRoot string) error {
+	// Get the PID before removing the file
+	pid, err := mayor.GetACPPid(townRoot)
+	if err != nil {
+		// PID file doesn't exist or is invalid, nothing to shut down
+		return nil
+	}
+
+	// Remove the PID file - this signals the ACP proxy to shut down gracefully
+	if err := mayor.RemoveACPPid(townRoot); err != nil {
+		return fmt.Errorf("removing ACP PID file: %w", err)
+	}
+
+	// Find the process
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return nil // Process doesn't exist
+	}
+
+	// Wait for the process to exit (with timeout)
+	fmt.Fprintf(os.Stderr, "Waiting for ACP session to shut down")
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(os.Stderr, ".")
+		// Check if process is still alive
+		if err := process.Signal(syscall.Signal(0)); err != nil {
+			// Process has exited
+			fmt.Fprintf(os.Stderr, " done\n")
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Process didn't exit gracefully, force kill
+	fmt.Fprintf(os.Stderr, " forcing shutdown\n")
+	_ = process.Kill()
+	time.Sleep(100 * time.Millisecond)
+	return nil
+}
+
 func runMayorStatus(cmd *cobra.Command, args []string) error {
-	mgr, err := getMayorManager()
+	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return err
 	}
 
-	info, err := mgr.Status()
+	mgr := mayor.NewManager(townRoot)
+	status, err := mgr.CombinedStatus()
 	if err != nil {
-		if err == mayor.ErrNotRunning {
-			fmt.Printf("%s Mayor session is %s\n",
-				style.Dim.Render("○"),
-				"not running")
-			fmt.Printf("\nStart with: %s\n", style.Dim.Render("gt mayor start"))
-			return nil
-		}
-		return fmt.Errorf("checking status: %w", err)
+		return err
 	}
 
-	status := "detached"
-	if info.Attached {
-		status = "attached"
+	if mayorStatusRunning {
+		fmt.Println(status.Active)
+		return nil
 	}
-	fmt.Printf("%s Mayor session is %s\n",
-		style.Bold.Render("●"),
-		style.Bold.Render("running"))
-	fmt.Printf("  Status: %s\n", status)
-	fmt.Printf("  Created: %s\n", info.Created)
-	fmt.Printf("\nAttach with: %s\n", style.Dim.Render("gt mayor attach"))
+
+	if !status.Active {
+		fmt.Printf("%s Mayor session is %s\n",
+			style.Dim.Render("○"),
+			"not running")
+		fmt.Printf("\nStart with: %s\n", style.Dim.Render("gt mayor start"))
+		return nil
+	}
+
+	if status.Tmux != nil {
+		attachedStatus := "detached"
+		if status.Tmux.Attached {
+			attachedStatus = "attached"
+		}
+		fmt.Printf("%s Mayor (tmux) is %s\n",
+			style.Bold.Render("●"),
+			style.Bold.Render("running"))
+		fmt.Printf("  Status: %s\n", attachedStatus)
+		fmt.Printf("  Created: %s\n", status.Tmux.Created)
+	}
+
+	if status.ACPPid != 0 {
+		fmt.Printf("%s Mayor (ACP) is %s\n",
+			style.Bold.Render("●"),
+			style.Bold.Render("running (headless)"))
+		fmt.Printf("  PID: %d\n", status.ACPPid)
+	}
+
+	if status.Tmux != nil {
+		fmt.Printf("\nAttach with: %s\n", style.Dim.Render("gt mayor attach"))
+	} else if status.ACPPid != 0 {
+		fmt.Printf("\nAttach with: %s\n", style.Dim.Render("gt mayor acp"))
+	}
 
 	return nil
 }
@@ -278,9 +389,11 @@ func runMayorRestart(cmd *cobra.Command, args []string) error {
 }
 
 // ensureMayorInfra checks that daemon and dolt are running before attaching
-// to the Mayor session. Warns and auto-starts each if absent. Non-fatal:
-// failures are reported but do not block the attach.
-func ensureMayorInfra(townRoot string) {
+// to the Mayor session. Warns and auto-starts each if absent.
+// Returns an error if Dolt fails to start — a missing Dolt server is fatal
+// for the Mayor (it cannot operate without database access).
+// Daemon failures are non-fatal (warned but do not block).
+func ensureMayorInfra(townRoot string) error {
 	// Load daemon.json env vars (e.g., GT_DOLT_PORT) so Dolt uses the right port.
 	if patrolCfg := daemon.LoadPatrolConfig(townRoot); patrolCfg != nil {
 		for k, v := range patrolCfg.Env {
@@ -288,7 +401,7 @@ func ensureMayorInfra(townRoot string) {
 		}
 	}
 
-	// Daemon
+	// Daemon (non-fatal)
 	daemonRunning, _, _ := daemon.IsRunning(townRoot)
 	if !daemonRunning {
 		style.PrintWarning("daemon is not running, starting...")
@@ -299,7 +412,7 @@ func ensureMayorInfra(townRoot string) {
 		}
 	}
 
-	// Dolt (skip if no local data dir or if server is remote)
+	// Dolt (fatal on failure — Mayor requires database access)
 	doltCfg := doltserver.DefaultConfig(townRoot)
 	if !doltCfg.IsRemote() {
 		if _, err := os.Stat(doltCfg.DataDir); err == nil {
@@ -307,11 +420,55 @@ func ensureMayorInfra(townRoot string) {
 			if !doltRunning {
 				style.PrintWarning("Dolt server is not running, starting...")
 				if err := doltserver.Start(townRoot); err != nil {
-					style.PrintWarning("Dolt server start failed: %v", err)
-				} else {
-					fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltCfg.Port)
+					// Enrich port-conflict errors with a concrete free-port suggestion.
+					msg := fmt.Sprintf("Dolt server start failed: %v", err)
+					if pid, dataDir := doltserver.PortHolder(doltCfg.Port); pid > 0 {
+						if dataDir != "" {
+							msg += fmt.Sprintf("\n  port %d held by dolt PID %d serving %s", doltCfg.Port, pid, dataDir)
+						} else {
+							msg += fmt.Sprintf("\n  port %d held by PID %d", doltCfg.Port, pid)
+						}
+					}
+					if freePort := doltserver.FindFreePort(doltCfg.Port + 1); freePort > 0 {
+						msg += fmt.Sprintf("\n\nConfigure a free port for this town, then retry:\n  gt config set dolt.port %d && gt mayor at", freePort)
+					}
+					return fmt.Errorf("%s", msg)
 				}
+				fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltCfg.Port)
 			}
 		}
 	}
+	return nil
+}
+
+// runMayorAcp runs the Mayor in headless mode for IDE integration.
+// It bypasses tmux and execs the agent directly with stdin/stdout connected.
+// A PID file is created to signal that automatic cleanup should be vetoed,
+// allowing the Mayor to review worker diffs before cleanup.
+func runMayorAcp(cmd *cobra.Command, args []string) error {
+	ctx := context.Background()
+
+	townRoot := acpTownRootOverride
+	if townRoot == "" {
+		townRoot = os.Getenv("GT_TOWN_ROOT")
+	}
+	if townRoot == "" {
+		var err error
+		townRoot, err = workspace.FindFromCwdOrError()
+		if err != nil {
+			return fmt.Errorf("not in a Gas Town workspace: %w", err)
+		}
+	}
+
+	if err := ensureMayorInfra(townRoot); err != nil {
+		return err
+	}
+
+	rigName := acpRigOverride
+	if rigName == "" {
+		rigName = os.Getenv("GT_RIG")
+	}
+
+	mgr := mayor.NewManager(townRoot)
+	return mgr.StartACP(ctx, mayorAgentOverride, rigName)
 }

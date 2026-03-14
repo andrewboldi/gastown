@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -172,6 +174,93 @@ func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
 	if !strings.Contains(cmd, "--model sonnet") {
 		t.Errorf("expected role_agents witness model flag in restart command, got: %q", cmd)
 	}
+}
+
+func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+
+	townRoot := t.TempDir()
+
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+	rigPath := filepath.Join(townRoot, "gastown")
+	crewDir := filepath.Join(rigPath, "crew", "bear")
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(crewDir, 0755); err != nil {
+		t.Fatalf("mkdir crew dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	_ = os.Setenv("GT_AGENT", "")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	_ = os.Chdir(crewDir)
+
+	t.Run("custom ContinuePrompt overrides default", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: true,
+			ContinuePrompt:  "Context compacted. Continue your previous task.",
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if !strings.Contains(cmd, "--continue") {
+			t.Errorf("expected --continue flag in restart command, got: %q", cmd)
+		}
+		if !strings.Contains(cmd, "Context compacted") {
+			t.Errorf("expected custom prompt in restart command, got: %q", cmd)
+		}
+	})
+
+	t.Run("empty ContinuePrompt falls back to default", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: true,
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if !strings.Contains(cmd, "--continue") {
+			t.Errorf("expected --continue flag in restart command, got: %q", cmd)
+		}
+		if !strings.Contains(cmd, "Continue your previous task") {
+			t.Errorf("expected default continuation message when ContinuePrompt is empty, got: %q", cmd)
+		}
+	})
+
+	t.Run("ContinueSession false uses beacon", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: false,
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if strings.Contains(cmd, "--continue") {
+			t.Errorf("expected no --continue flag when ContinueSession is false, got: %q", cmd)
+		}
+	})
 }
 
 func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
@@ -427,7 +516,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		dir := makeTestGitRepo(t)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
-		output := captureStdout(t, func() {
+		output := captureStderr(t, func() {
 			warnHandoffGitStatus()
 		})
 		if output != "" {
@@ -440,7 +529,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("x"), 0644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
-		output := captureStdout(t, func() {
+		output := captureStderr(t, func() {
 			warnHandoffGitStatus()
 		})
 		if !strings.Contains(output, "uncommitted work") {
@@ -462,7 +551,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		os.WriteFile(fpath, []byte("modified"), 0644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
-		output := captureStdout(t, func() {
+		output := captureStderr(t, func() {
 			warnHandoffGitStatus()
 		})
 		if !strings.Contains(output, "uncommitted work") {
@@ -480,7 +569,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, ".beads", "somefile.db"), []byte("db"), 0644)
 		os.Chdir(dir)
 		t.Cleanup(func() { os.Chdir(origCwd) })
-		output := captureStdout(t, func() {
+		output := captureStderr(t, func() {
 			warnHandoffGitStatus()
 		})
 		if output != "" {
@@ -490,7 +579,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 
 	t.Run("no warning outside git repo", func(t *testing.T) {
 		os.Chdir(os.TempDir())
-		output := captureStdout(t, func() {
+		output := captureStderr(t, func() {
 			warnHandoffGitStatus()
 		})
 		if output != "" {
@@ -507,7 +596,7 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		origFlag := handoffNoGitCheck
 		handoffNoGitCheck = true
 		defer func() { handoffNoGitCheck = origFlag }()
-		output := captureStdout(t, func() {
+		output := captureStderr(t, func() {
 			if !handoffNoGitCheck {
 				warnHandoffGitStatus()
 			}
@@ -637,6 +726,136 @@ func TestCollectGitState(t *testing.T) {
 		state := collectGitState()
 		if state != "" {
 			t.Errorf("expected empty string outside git repo, got: %s", state)
+		}
+	})
+}
+
+// TestRecordHandoffTime verifies that recordHandoffTime creates the
+// timestamp file in .runtime/ with a recent modification time.
+func TestRecordHandoffTime(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	recordHandoffTime()
+
+	tsPath := filepath.Join(tmpDir, constants.DirRuntime, constants.FileLastHandoffTS)
+	info, err := os.Stat(tsPath)
+	if err != nil {
+		t.Fatalf("expected last_handoff_ts file to exist: %v", err)
+	}
+	if time.Since(info.ModTime()) > 5*time.Second {
+		t.Errorf("expected recent modification time, got %v ago", time.Since(info.ModTime()))
+	}
+}
+
+// TestEnforceHandoffCooldown verifies the cooldown logic:
+// - No cooldown when no previous handoff recorded
+// - Cooldown triggers when last handoff was recent
+// - No cooldown when enough time has passed
+func TestEnforceHandoffCooldown(t *testing.T) {
+	t.Run("no cooldown without previous handoff", func(t *testing.T) {
+		t.Setenv("GT_ROLE", "")
+		tmpDir := t.TempDir()
+		t.Chdir(tmpDir)
+
+		start := time.Now()
+		enforceHandoffCooldown()
+		elapsed := time.Since(start)
+
+		// Should return almost immediately (no file to check)
+		if elapsed > 1*time.Second {
+			t.Errorf("expected no cooldown, but waited %v", elapsed)
+		}
+	})
+
+	t.Run("no cooldown when last handoff is old", func(t *testing.T) {
+		t.Setenv("GT_ROLE", "")
+		tmpDir := t.TempDir()
+		t.Chdir(tmpDir)
+
+		// Create a last_handoff_ts file with old mtime
+		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+		os.MkdirAll(runtimeDir, 0755)
+		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+		os.WriteFile(tsPath, []byte("1000000000"), 0644)
+		// Set mtime to well in the past
+		oldTime := time.Now().Add(-10 * time.Minute)
+		os.Chtimes(tsPath, oldTime, oldTime)
+
+		start := time.Now()
+		enforceHandoffCooldown()
+		elapsed := time.Since(start)
+
+		if elapsed > 1*time.Second {
+			t.Errorf("expected no cooldown for old handoff, but waited %v", elapsed)
+		}
+	})
+
+	t.Run("cooldown triggers for recent handoff", func(t *testing.T) {
+		// Use a non-exempt role so cooldown applies
+		t.Setenv("GT_ROLE", "gastown/witness")
+		tmpDir := t.TempDir()
+		t.Chdir(tmpDir)
+
+		// Create a last_handoff_ts file with very recent mtime
+		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+		os.MkdirAll(runtimeDir, 0755)
+		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+		os.WriteFile(tsPath, []byte("now"), 0644)
+		// Set mtime to (MinHandoffCooldown - 1s) ago so remaining is ~1s
+		recentTime := time.Now().Add(-(constants.MinHandoffCooldown - 1*time.Second))
+		os.Chtimes(tsPath, recentTime, recentTime)
+
+		start := time.Now()
+		enforceHandoffCooldown()
+		elapsed := time.Since(start)
+
+		// Should have waited approximately 1 second (the remaining cooldown)
+		if elapsed < 500*time.Millisecond {
+			t.Errorf("expected cooldown sleep of ~1s, but only waited %v", elapsed)
+		}
+		if elapsed > 3*time.Second {
+			t.Errorf("expected cooldown sleep of ~1s, but waited %v", elapsed)
+		}
+	})
+
+	t.Run("no cooldown for crew role", func(t *testing.T) {
+		t.Setenv("GT_ROLE", "gastown/crew/max")
+		tmpDir := t.TempDir()
+		t.Chdir(tmpDir)
+
+		// Create a recent handoff file that would normally trigger cooldown
+		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+		os.MkdirAll(runtimeDir, 0755)
+		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+		os.WriteFile(tsPath, []byte("now"), 0644)
+
+		start := time.Now()
+		enforceHandoffCooldown()
+		elapsed := time.Since(start)
+
+		if elapsed > 1*time.Second {
+			t.Errorf("crew should be exempt from cooldown, but waited %v", elapsed)
+		}
+	})
+
+	t.Run("no cooldown for mayor role", func(t *testing.T) {
+		t.Setenv("GT_ROLE", "mayor")
+		tmpDir := t.TempDir()
+		t.Chdir(tmpDir)
+
+		// Create a recent handoff file that would normally trigger cooldown
+		runtimeDir := filepath.Join(tmpDir, constants.DirRuntime)
+		os.MkdirAll(runtimeDir, 0755)
+		tsPath := filepath.Join(runtimeDir, constants.FileLastHandoffTS)
+		os.WriteFile(tsPath, []byte("now"), 0644)
+
+		start := time.Now()
+		enforceHandoffCooldown()
+		elapsed := time.Since(start)
+
+		if elapsed > 1*time.Second {
+			t.Errorf("mayor should be exempt from cooldown, but waited %v", elapsed)
 		}
 	})
 }

@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/steveyegge/gastown/internal/cli"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -105,6 +106,133 @@ func showMoleculeExecutionPrompt(workDir, moleculeID string) {
 	}
 }
 
+// showFormulaSteps renders the formula steps inline in the prime output.
+// Agents read these steps instead of materializing them as wisp rows.
+// The label parameter customizes the section header (e.g., "Patrol Steps", "Work Steps").
+// extraVars is an optional list of "key=value" overrides that are substituted into
+// step descriptions before rendering, taking precedence over formula defaults.
+func showFormulaSteps(formulaName, label string, extraVars ...[]string) {
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		style.PrintWarning("could not load formula %s: %v", formulaName, err)
+		return
+	}
+
+	f, err := formula.Parse(content)
+	if err != nil {
+		style.PrintWarning("could not parse formula %s: %v", formulaName, err)
+		return
+	}
+
+	if len(f.Steps) == 0 {
+		return
+	}
+
+	var vars []string
+	if len(extraVars) > 0 {
+		vars = extraVars[0]
+	}
+	varMap := buildFormulaVarMap(f, vars)
+
+	fmt.Println()
+	fmt.Printf("**%s** (%d steps from %s):\n", label, len(f.Steps), formulaName)
+	for i, step := range f.Steps {
+		desc := applyFormulaVars(step.Description, varMap)
+		fmt.Printf("  %d. **%s** — %s\n", i+1, step.Title, truncateDescription(desc, 120))
+	}
+	fmt.Println()
+}
+
+// showFormulaStepsFull renders formula steps with full descriptions.
+// Used for polecat work formulas where step details are the primary instructions.
+// extraVars is an optional list of "key=value" overrides substituted into step descriptions.
+func showFormulaStepsFull(formulaName string, extraVars ...[]string) {
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		style.PrintWarning("could not load formula %s: %v", formulaName, err)
+		return
+	}
+
+	f, err := formula.Parse(content)
+	if err != nil {
+		style.PrintWarning("could not parse formula %s: %v", formulaName, err)
+		return
+	}
+
+	if len(f.Steps) == 0 {
+		return
+	}
+
+	var vars []string
+	if len(extraVars) > 0 {
+		vars = extraVars[0]
+	}
+	varMap := buildFormulaVarMap(f, vars)
+
+	fmt.Println()
+	fmt.Printf("**Formula Checklist** (%d steps from %s):\n\n", len(f.Steps), formulaName)
+	for i, step := range f.Steps {
+		title := applyFormulaVars(step.Title, varMap)
+		fmt.Printf("### Step %d: %s\n\n", i+1, title)
+		if step.Description != "" {
+			fmt.Println(applyFormulaVars(step.Description, varMap))
+			fmt.Println()
+		}
+	}
+}
+
+// buildFormulaVarMap builds a map of variable name → value for substitution.
+// Formula defaults are applied first; extraVars (key=value strings) override them.
+func buildFormulaVarMap(f *formula.Formula, extraVars []string) map[string]string {
+	m := make(map[string]string, len(f.Vars))
+	for k, v := range f.Vars {
+		if v.Default != "" {
+			m[k] = v.Default
+		}
+	}
+	for _, kv := range extraVars {
+		if idx := strings.IndexByte(kv, '='); idx > 0 {
+			m[kv[:idx]] = kv[idx+1:]
+		}
+	}
+	return m
+}
+
+// applyFormulaVars replaces {{key}} placeholders in text with values from varMap.
+func applyFormulaVars(text string, varMap map[string]string) string {
+	for k, v := range varMap {
+		text = strings.ReplaceAll(text, "{{"+k+"}}", v)
+	}
+	return text
+}
+
+// extractFormulaVar extracts a specific key's value from a newline-separated
+// key=value string (as stored in AttachmentFields.FormulaVars).
+// Returns "" if the key is not found.
+func extractFormulaVar(formulaVars, key string) string {
+	for _, line := range strings.Split(formulaVars, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+// truncateDescription truncates a multi-line description to a single line summary.
+func truncateDescription(desc string, maxLen int) string {
+	// Take just the first line
+	if idx := strings.IndexByte(desc, '\n'); idx >= 0 {
+		desc = desc[:idx]
+	}
+	desc = strings.TrimSpace(desc)
+	if len(desc) > maxLen {
+		desc = desc[:maxLen-3] + "..."
+	}
+	if desc == "" {
+		desc = "(no description)"
+	}
+	return desc
+}
+
 // outputMoleculeContext checks if the agent is working on a molecule step and shows progress.
 func outputMoleculeContext(ctx RoleContext) {
 	// Applies to polecats, crew workers, deacon, witness, and refinery
@@ -130,111 +258,11 @@ func outputMoleculeContext(ctx RoleContext) {
 		return
 	}
 
-	// Check for in-progress issues
-	b := beads.New(ctx.WorkDir)
-	issues, err := b.List(beads.ListOptions{
-		Status:   "in_progress",
-		Assignee: ctx.Polecat,
-		Priority: -1,
-	})
-	if err != nil || len(issues) == 0 {
-		return
-	}
-
-	// Check if any in-progress issue is a molecule step
-	for _, issue := range issues {
-		moleculeID := parseMoleculeMetadata(issue.Description)
-		if moleculeID == "" {
-			continue
-		}
-
-		// Get the parent (root) issue ID
-		rootID := issue.Parent
-		if rootID == "" {
-			continue
-		}
-
-		// This is a molecule step - show context
-		fmt.Println()
-		fmt.Printf("%s\n\n", style.Bold.Render("## 🧬 Molecule Workflow"))
-		fmt.Printf("You are working on a molecule step.\n")
-		fmt.Printf("  Current step: %s\n", issue.ID)
-		fmt.Printf("  Molecule: %s\n", moleculeID)
-		fmt.Printf("  Root issue: %s\n\n", rootID)
-
-		// Show molecule progress by finding sibling steps
-		showMoleculeProgress(b, rootID)
-
-		fmt.Println()
-		fmt.Println("**Molecule Work Loop:**")
-		fmt.Println("1. Complete current step, then `bd close " + issue.ID + "`")
-		fmt.Println("2. Check for next steps: `bd mol current`")
-		fmt.Println("3. Work on next ready step(s)")
-		fmt.Println("4. When all steps done, run `" + cli.Name() + " done`")
-		break // Only show context for first molecule step found
-	}
+	// For polecats with root-only wisps, formula steps are shown inline
+	// in outputMoleculeWorkflow() via the attached_formula field.
+	// No child-based tracking needed.
 }
 
-// parseMoleculeMetadata extracts molecule info from a step's description.
-// Looks for lines like:
-//
-//	instantiated_from: mol-xyz
-func parseMoleculeMetadata(description string) string {
-	lines := strings.Split(description, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "instantiated_from:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "instantiated_from:"))
-		}
-	}
-	return ""
-}
-
-// showMoleculeProgress displays the progress through a molecule's steps.
-func showMoleculeProgress(b *beads.Beads, rootID string) {
-	if rootID == "" {
-		return
-	}
-
-	// Find all children of the root issue
-	children, err := b.List(beads.ListOptions{
-		Parent:   rootID,
-		Status:   "all",
-		Priority: -1,
-	})
-	if err != nil || len(children) == 0 {
-		return
-	}
-
-	total := len(children)
-	done := 0
-	inProgress := 0
-	var readySteps []string
-
-	for _, child := range children {
-		switch child.Status {
-		case "closed":
-			done++
-		case "in_progress":
-			inProgress++
-		case "open":
-			// Check if ready (no open dependencies)
-			if len(child.DependsOn) == 0 {
-				readySteps = append(readySteps, child.ID)
-			}
-		}
-	}
-
-	fmt.Printf("Progress: %d/%d steps complete", done, total)
-	if inProgress > 0 {
-		fmt.Printf(" (%d in progress)", inProgress)
-	}
-	fmt.Println()
-
-	if len(readySteps) > 0 {
-		fmt.Printf("Ready steps: %s\n", strings.Join(readySteps, ", "))
-	}
-}
 
 // outputDeaconPatrolContext shows patrol molecule status for the Deacon.
 // Deacon uses wisps (Wisp:true issues in main .beads/) for patrol cycles.
@@ -249,65 +277,65 @@ func outputDeaconPatrolContext(ctx RoleContext) {
 
 	cfg := PatrolConfig{
 		RoleName:        "deacon",
-		PatrolMolName:   "mol-deacon-patrol",
+		PatrolMolName:   constants.MolDeaconPatrol,
 		BeadsDir:        ctx.TownRoot, // Town-level role uses town root beads
 		Assignee:        "deacon",
 		HeaderEmoji:     "🔄",
 		HeaderTitle:     "Patrol Status (Wisp-based)",
 		WorkLoopSteps: []string{
-			"Check next step: `bd mol current`",
-			"Execute the step (heartbeat, mail, health checks, etc.)",
-			"Close step: `bd close <step-id>`",
-			"Check next: `bd mol current`",
-			"At cycle end (loop-or-exit step):\n   - If context LOW:\n     * Squash: `" + cli.Name() + " mol squash --no-digest --jitter 10s --summary \"<summary>\"`\n     * Create new patrol: `" + cli.Name() + " patrol new`\n     * Continue executing from inbox-check step\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Deacon patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
+			"Work through each patrol step in sequence (see checklist below)",
+			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Deacon patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
 	outputPatrolContext(cfg)
+	showFormulaSteps(constants.MolDeaconPatrol, "Patrol Steps")
 }
 
 // outputWitnessPatrolContext shows patrol molecule status for the Witness.
 // Witness AUTO-BONDS its patrol molecule on startup if one isn't already running.
 func outputWitnessPatrolContext(ctx RoleContext) {
+	if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+		fmt.Printf("\n⏸️  Rig %s is %s — skipping patrol wisp generation.\n", ctx.Rig, reason)
+		return
+	}
 	cfg := PatrolConfig{
 		RoleName:        "witness",
-		PatrolMolName:   "mol-witness-patrol",
+		PatrolMolName:   constants.MolWitnessPatrol,
 		BeadsDir:        ctx.WorkDir,
 		Assignee:        ctx.Rig + "/witness",
 		HeaderEmoji:     constants.EmojiWitness,
 		HeaderTitle:     "Witness Patrol Status",
 		WorkLoopSteps: []string{
-			"Check inbox: `" + cli.Name() + " mail inbox`",
-			"Check next step: `bd mol current`",
-			"Execute the step (survey polecats, inspect, nudge, etc.)",
-			"Close step: `bd close <step-id>`",
-			"Check next: `bd mol current`",
-			"At cycle end (loop-or-exit step):\n   - If context LOW:\n     * Squash: `" + cli.Name() + " mol squash --no-digest --jitter 10s --summary \"<summary>\"`\n     * Create new patrol: `" + cli.Name() + " patrol new`\n     * Continue executing from inbox-check step\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Witness patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
+			"Work through each patrol step in sequence (see checklist below)",
+			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Witness patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
 	outputPatrolContext(cfg)
+	showFormulaSteps(constants.MolWitnessPatrol, "Patrol Steps")
 }
 
 // outputRefineryPatrolContext shows patrol molecule status for the Refinery.
 // Refinery AUTO-BONDS its patrol molecule on startup if one isn't already running.
 func outputRefineryPatrolContext(ctx RoleContext) {
+	if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+		fmt.Printf("\n⏸️  Rig %s is %s — skipping patrol wisp generation.\n", ctx.Rig, reason)
+		return
+	}
 	cfg := PatrolConfig{
 		RoleName:        "refinery",
-		PatrolMolName:   "mol-refinery-patrol",
+		PatrolMolName:   constants.MolRefineryPatrol,
 		BeadsDir:        ctx.WorkDir,
 		Assignee:        ctx.Rig + "/refinery",
 		HeaderEmoji:     "🔧",
 		HeaderTitle:     "Refinery Patrol Status",
 		ExtraVars:       buildRefineryPatrolVars(ctx),
 		WorkLoopSteps: []string{
-			"Check inbox: `" + cli.Name() + " mail inbox`",
-			"Check next step: `bd mol current`",
-			"Execute the step (queue scan, process branch, tests, merge)",
-			"Close step: `bd close <step-id>`",
-			"Check next: `bd mol current`",
-			"At cycle end (loop-or-exit step):\n   - If context LOW:\n     * Squash: `" + cli.Name() + " mol squash --no-digest --jitter 10s --summary \"<summary>\"`\n     * Create new patrol: `" + cli.Name() + " patrol new`\n     * Continue executing from inbox-check step\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Refinery patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
+			"Work through each patrol step in sequence (see checklist below)",
+			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Refinery patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
 	outputPatrolContext(cfg)
+	showFormulaStepsFull(constants.MolRefineryPatrol, cfg.ExtraVars)
 }
 
 // buildRefineryPatrolVars loads rig MQ settings and returns --var key=value
@@ -326,37 +354,59 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 	// default_branch.
 	defaultBranch := "main"
 	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err == nil && rigCfg.DefaultBranch != "" {
+	if err == nil && rigCfg != nil && rigCfg.DefaultBranch != "" {
 		defaultBranch = rigCfg.DefaultBranch
 	}
 	vars = append(vars, fmt.Sprintf("target_branch=%s", defaultBranch))
 
-	// MQ-specific vars require settings/config.json with a merge_queue section
+	// MQ-specific vars: try settings/config.json first (legacy format), then
+	// fall back to the layered rig config (bead labels / wisp layer).
 	settingsPath := filepath.Join(rigPath, "settings", "config.json")
 	settings, sErr := config.LoadRigSettings(settingsPath)
-	if sErr != nil || settings == nil || settings.MergeQueue == nil {
+	if sErr == nil && settings != nil && settings.MergeQueue != nil {
+		mq := settings.MergeQueue
+		vars = append(vars, fmt.Sprintf("integration_branch_refinery_enabled=%t", mq.IsRefineryIntegrationEnabled()))
+		vars = append(vars, fmt.Sprintf("integration_branch_auto_land=%t", mq.IsIntegrationBranchAutoLandEnabled()))
+		vars = append(vars, fmt.Sprintf("run_tests=%t", mq.IsRunTestsEnabled()))
+		if mq.SetupCommand != "" {
+			vars = append(vars, fmt.Sprintf("setup_command=%s", mq.SetupCommand))
+		}
+		if mq.TypecheckCommand != "" {
+			vars = append(vars, fmt.Sprintf("typecheck_command=%s", mq.TypecheckCommand))
+		}
+		if mq.LintCommand != "" {
+			vars = append(vars, fmt.Sprintf("lint_command=%s", mq.LintCommand))
+		}
+		if mq.TestCommand != "" {
+			vars = append(vars, fmt.Sprintf("test_command=%s", mq.TestCommand))
+		}
+		if mq.BuildCommand != "" {
+			vars = append(vars, fmt.Sprintf("build_command=%s", mq.BuildCommand))
+		}
+		vars = append(vars, fmt.Sprintf("delete_merged_branches=%t", mq.IsDeleteMergedBranchesEnabled()))
 		return vars
 	}
-	mq := settings.MergeQueue
 
-	vars = append(vars, fmt.Sprintf("integration_branch_refinery_enabled=%t", mq.IsRefineryIntegrationEnabled()))
-	vars = append(vars, fmt.Sprintf("integration_branch_auto_land=%t", mq.IsIntegrationBranchAutoLandEnabled()))
-	vars = append(vars, fmt.Sprintf("run_tests=%t", mq.IsRunTestsEnabled()))
-	if mq.SetupCommand != "" {
-		vars = append(vars, fmt.Sprintf("setup_command=%s", mq.SetupCommand))
+	// Fallback: read command vars from rig identity bead labels.
+	// This is the path for rigs using `gt rig config set --global` (bead layer).
+	// We use native bd routing (no explicit BEADS_DIR) to avoid dolt database
+	// name mismatches that occur when bypassing the routing system.
+	if rigCfg != nil && rigCfg.Beads != nil && rigCfg.Beads.Prefix != "" {
+		rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, ctx.Rig)
+		bd := beads.New(ctx.TownRoot)
+		if issue, err := bd.Show(rigBeadID); err == nil {
+			labelMap := make(map[string]string, len(issue.Labels))
+			for _, label := range issue.Labels {
+				if idx := strings.IndexByte(label, ':'); idx > 0 {
+					labelMap[label[:idx]] = label[idx+1:]
+				}
+			}
+			for _, key := range []string{"integration_branch_refinery_enabled", "integration_branch_auto_land", "run_tests", "delete_merged_branches", "setup_command", "typecheck_command", "lint_command", "test_command", "build_command"} {
+				if val := labelMap[key]; val != "" {
+					vars = append(vars, fmt.Sprintf("%s=%s", key, val))
+				}
+			}
+		}
 	}
-	if mq.TypecheckCommand != "" {
-		vars = append(vars, fmt.Sprintf("typecheck_command=%s", mq.TypecheckCommand))
-	}
-	if mq.LintCommand != "" {
-		vars = append(vars, fmt.Sprintf("lint_command=%s", mq.LintCommand))
-	}
-	if mq.TestCommand != "" {
-		vars = append(vars, fmt.Sprintf("test_command=%s", mq.TestCommand))
-	}
-	if mq.BuildCommand != "" {
-		vars = append(vars, fmt.Sprintf("build_command=%s", mq.BuildCommand))
-	}
-	vars = append(vars, fmt.Sprintf("delete_merged_branches=%t", mq.IsDeleteMergedBranchesEnabled()))
 	return vars
 }

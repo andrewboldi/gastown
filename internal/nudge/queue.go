@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
@@ -32,17 +33,16 @@ const (
 )
 
 // Operational limits and defaults.
+// These are compiled-in fallbacks. Configurable via operational.nudge
+// in settings/config.json (ZFC pattern).
 const (
 	// DefaultNormalTTL is the time-to-live for normal-priority nudges.
-	// After this duration, undelivered nudges are discarded by Drain.
 	DefaultNormalTTL = 30 * time.Minute
 
 	// DefaultUrgentTTL is the time-to-live for urgent-priority nudges.
 	DefaultUrgentTTL = 2 * time.Hour
 
 	// MaxQueueDepth is the maximum number of pending nudges per session.
-	// Enqueue returns an error if the queue is full, preventing runaway senders
-	// from exhausting disk space.
 	MaxQueueDepth = 50
 
 	// staleClaimThreshold is how long a .claimed file must be untouched
@@ -50,13 +50,24 @@ const (
 	staleClaimThreshold = 5 * time.Minute
 )
 
+// nudgeConfig loads nudge-specific thresholds from town settings.
+func nudgeConfig(townRoot string) *config.NudgeThresholds {
+	return config.LoadOperationalConfig(townRoot).GetNudgeConfig()
+}
+
 // QueuedNudge represents a nudge message stored in the queue.
 type QueuedNudge struct {
 	Sender    string    `json:"sender"`
 	Message   string    `json:"message"`
 	Priority  string    `json:"priority"`
+	Kind      string    `json:"kind,omitempty"`
+	ThreadID  string    `json:"thread_id,omitempty"`
+	Severity  string    `json:"severity,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// DeliverAfter, if non-zero, defers delivery until this time has passed.
+	// Drain skips (but does not discard) the nudge until the deadline is met.
+	DeliverAfter time.Time `json:"deliver_after,omitempty"`
 }
 
 // queueDir returns the nudge queue directory for a given session.
@@ -85,9 +96,10 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	}
 
 	// Check queue depth before writing to prevent runaway senders.
+	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
 	pending, _ := Pending(townRoot, session)
-	if pending >= MaxQueueDepth {
-		return fmt.Errorf("nudge queue for %s is full (%d/%d pending)", session, pending, MaxQueueDepth)
+	if pending >= maxDepth {
+		return fmt.Errorf("nudge queue for %s is full (%d/%d pending)", session, pending, maxDepth)
 	}
 
 	if nudge.Timestamp.IsZero() {
@@ -125,6 +137,21 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	return nil
 }
 
+// Requeue writes previously drained nudges back to the queue for later delivery.
+// Existing timestamps are preserved so FIFO ordering remains stable relative to
+// one another; only expired nudges are skipped.
+func Requeue(townRoot, session string, nudges []QueuedNudge) error {
+	for _, n := range nudges {
+		if !n.ExpiresAt.IsZero() && time.Now().After(n.ExpiresAt) {
+			continue
+		}
+		if err := Enqueue(townRoot, session, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Drain reads and removes all queued nudges for a session, returning them
 // in FIFO order. This is called by the hook to pick up pending nudges.
 //
@@ -150,7 +177,7 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 	// normal processing completes in milliseconds. We rename it back to .json
 	// so it gets picked up on this or a future Drain call, rather than deleting
 	// it (which would permanently drop the nudge).
-	// Claim files have the pattern: <original>.json.claimed.<suffix>
+	staleThreshold := nudgeConfig(townRoot).StaleClaimThresholdD()
 	now := time.Now()
 	for _, entry := range entries {
 		if !strings.Contains(entry.Name(), ".claimed") {
@@ -160,7 +187,7 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 		if err != nil {
 			continue
 		}
-		if now.Sub(info.ModTime()) > staleClaimThreshold {
+		if now.Sub(info.ModTime()) > staleThreshold {
 			orphanPath := filepath.Join(dir, entry.Name())
 			// Strip everything from ".claimed" onward to restore original .json filename
 			name := entry.Name()
@@ -232,6 +259,14 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 			continue
 		}
 
+		// Deferred nudge: not ready yet — unclaim and leave in queue.
+		if !n.DeliverAfter.IsZero() && now.Before(n.DeliverAfter) {
+			if renameErr := os.Rename(claimPath, path); renameErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to unclaim deferred nudge %s: %v\n", entry.Name(), renameErr)
+			}
+			continue
+		}
+
 		nudges = append(nudges, n)
 
 		// Remove the claimed file after successful processing
@@ -264,6 +299,18 @@ func Pending(townRoot, session string) (int, error) {
 	}
 
 	return count, nil
+}
+
+// QueueLen returns the number of pending nudges for a session without draining.
+// Returns 0 on error — callers use this for quick checks. Missing queue
+// directories are expected (no nudges yet) and silenced; other filesystem
+// errors are logged to stderr so they don't go unnoticed.
+func QueueLen(townRoot, session string) int {
+	n, err := Pending(townRoot, session)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: nudge queue check failed for %s: %v\n", session, err)
+	}
+	return n
 }
 
 // FormatForInjection formats queued nudges as a system-reminder block

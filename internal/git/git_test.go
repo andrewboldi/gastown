@@ -265,6 +265,39 @@ func TestCheckout(t *testing.T) {
 	}
 }
 
+func TestCheckoutNewBranch(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Get current HEAD ref
+	head, err := g.run("rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	// Create and checkout a new branch from HEAD
+	if err := g.CheckoutNewBranch("feature-new", strings.TrimSpace(head)); err != nil {
+		t.Fatalf("CheckoutNewBranch: %v", err)
+	}
+
+	branch, _ := g.CurrentBranch()
+	if branch != "feature-new" {
+		t.Errorf("branch = %q, want feature-new", branch)
+	}
+
+	// Verify it fails if branch already exists
+	if err := g.Checkout("main"); err != nil {
+		// Try master for older git
+		if err := g.Checkout("master"); err != nil {
+			t.Fatalf("Checkout main/master: %v", err)
+		}
+	}
+	err = g.CheckoutNewBranch("feature-new", "HEAD")
+	if err == nil {
+		t.Error("expected error creating duplicate branch, got nil")
+	}
+}
+
 func TestNotARepo(t *testing.T) {
 	dir := t.TempDir() // Empty dir, not a git repo
 	g := NewGit(dir)
@@ -1552,5 +1585,176 @@ func TestClearPushURL(t *testing.T) {
 	// Clearing again should be a no-op (not an error)
 	if err := g.ClearPushURL("origin"); err != nil {
 		t.Errorf("ClearPushURL (idempotent) should not error, got: %v", err)
+	}
+}
+
+func TestIsGasTownRuntimePath(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{".claude/", true},
+		{".claude/settings.json", true},
+		{".claude/commands/foo.md", true},
+		{".claude", true},
+		{".runtime/", true},
+		{".runtime/state.json", true},
+		{".runtime", true},
+		{".beads/", true},
+		{".beads/db.json", true},
+		{".logs/agent.log", true},
+		{"__pycache__/", true},
+		{"__pycache__/foo.cpython-312.pyc", true},
+		{"src/__pycache__/bar.pyc", true},
+		{"src/main.go", false},
+		{"README.md", false},
+		{".gitignore", false},
+		{"claude-stuff/foo", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := isGasTownRuntimePath(tt.path)
+			if got != tt.want {
+				t.Errorf("isGasTownRuntimePath(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanExcludingRuntime(t *testing.T) {
+	tests := []struct {
+		name string
+		s    UncommittedWorkStatus
+		want bool
+	}{
+		{
+			name: "only runtime artifacts",
+			s: UncommittedWorkStatus{
+				HasUncommittedChanges: true,
+				UntrackedFiles:        []string{".claude/", ".runtime/state.json"},
+			},
+			want: true,
+		},
+		{
+			name: "real code changes",
+			s: UncommittedWorkStatus{
+				HasUncommittedChanges: true,
+				ModifiedFiles:         []string{"src/main.go"},
+			},
+			want: false,
+		},
+		{
+			name: "mix of runtime and real",
+			s: UncommittedWorkStatus{
+				HasUncommittedChanges: true,
+				UntrackedFiles:        []string{".claude/settings.json"},
+				ModifiedFiles:         []string{"src/main.go"},
+			},
+			want: false,
+		},
+		{
+			name: "clean",
+			s:    UncommittedWorkStatus{},
+			want: true,
+		},
+		{
+			name: "stashes block",
+			s: UncommittedWorkStatus{
+				StashCount: 1,
+			},
+			want: false,
+		},
+		{
+			name: "unpushed commits block",
+			s: UncommittedWorkStatus{
+				UnpushedCommits: 2,
+			},
+			want: false,
+		},
+		{
+			name: "pycache untracked",
+			s: UncommittedWorkStatus{
+				HasUncommittedChanges: true,
+				UntrackedFiles:        []string{"__pycache__/foo.pyc", ".beads/db"},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.s.CleanExcludingRuntime()
+			if got != tt.want {
+				t.Errorf("CleanExcludingRuntime() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckBranchContamination(t *testing.T) {
+	// Create a repo with main and a feature branch that diverges.
+	dir := initTestRepo(t) // has initial commit on default branch
+	g := NewGit(dir)
+
+	// Create a "main" branch explicitly and add commits to it.
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	// Rename default branch to main for consistency.
+	run("branch", "-M", "main")
+
+	// Create feature branch from current state.
+	run("checkout", "-b", "feature")
+
+	// Add a commit on feature.
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature work"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "feature commit")
+
+	// Switch back to main and add several commits (simulating upstream progress).
+	run("checkout", "main")
+	for i := 0; i < 5; i++ {
+		fname := filepath.Join(dir, "main_"+strings.Repeat("x", i+1)+".txt")
+		if err := os.WriteFile(fname, []byte("main work"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		run("add", ".")
+		run("commit", "-m", "main commit")
+	}
+
+	// Check contamination from the feature branch's perspective.
+	run("checkout", "feature")
+	contam, err := g.CheckBranchContamination("main")
+	if err != nil {
+		t.Fatalf("CheckBranchContamination: %v", err)
+	}
+
+	if contam.Behind != 5 {
+		t.Errorf("Behind = %d, want 5", contam.Behind)
+	}
+	if contam.Ahead != 1 {
+		t.Errorf("Ahead = %d, want 1", contam.Ahead)
+	}
+
+	// From main's perspective: 0 behind, 5 ahead of feature's merge-base.
+	run("checkout", "main")
+	contam, err = g.CheckBranchContamination("feature")
+	if err != nil {
+		t.Fatalf("CheckBranchContamination from main: %v", err)
+	}
+	if contam.Behind != 1 {
+		t.Errorf("Behind (from main) = %d, want 1", contam.Behind)
+	}
+	if contam.Ahead != 5 {
+		t.Errorf("Ahead (from main) = %d, want 5", contam.Ahead)
 	}
 }

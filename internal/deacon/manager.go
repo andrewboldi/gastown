@@ -28,6 +28,7 @@ type tmuxOps interface {
 	NewSessionWithCommand(name, workDir, command string) error
 	SetRemainOnExit(pane string, on bool) error
 	SetEnvironment(session, key, value string) error
+	GetPaneID(session string) (string, error)
 	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
 	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
 	SetAutoRespawnHook(session string) error
@@ -82,7 +83,10 @@ func (m *Manager) Start(agentOverride string) error {
 		if t.IsAgentAlive(sessionID) {
 			return ErrAlreadyRunning
 		}
-		// Zombie - tmux alive but agent dead. Kill and recreate.
+
+		// Session exists but agent is dead. Kill and recreate uniformly.
+		// The auto-respawn hook (SetAutoRespawnHook) handles clean exits at the
+		// tmux level — Go doesn't need to distinguish dead pane vs zombie shell.
 		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 		if err := t.KillSessionWithProcesses(sessionID); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
@@ -131,13 +135,19 @@ func (m *Manager) Start(agentOverride string) error {
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "deacon",
-		TownRoot: m.townRoot,
-		Agent:    agentOverride,
+		Role:        "deacon",
+		TownRoot:    m.townRoot,
+		Agent:       agentOverride,
+		SessionName: sessionID,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
+	}
+
+	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
+	if paneID, err := t.GetPaneID(sessionID); err == nil {
+		_ = t.SetEnvironment(sessionID, "GT_PANE_ID", paneID)
 	}
 
 	// Apply Deacon theming (non-fatal: theming failure doesn't affect operation)

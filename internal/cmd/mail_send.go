@@ -3,10 +3,12 @@ package cmd
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
@@ -55,10 +57,12 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		if to == "" {
 			return fmt.Errorf("cannot determine identity (role: %s)", ctx.Role)
 		}
+	} else if mailTo != "" {
+		to = mailTo
 	} else if len(args) > 0 {
 		to = args[0]
 	} else {
-		return fmt.Errorf("address required (or use --self)")
+		return fmt.Errorf("address required (use positional arg, --to, or --self)")
 	}
 
 	// All mail uses town beads (two-level architecture)
@@ -138,7 +142,13 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 
 	recipients, err := resolver.Resolve(to)
 	if err != nil {
-		// Fall back to legacy routing if resolver fails
+		// Validation errors are definitive — do not fall back to legacy routing,
+		// which would silently deliver to a dead inbox.
+		// See: https://github.com/steveyegge/gastown/issues/2038
+		if errors.Is(err, mail.ErrUnknownRecipient) {
+			return err
+		}
+		// Fall back to legacy routing for infrastructure errors (beads down, etc.)
 		router := mail.NewRouter(workDir)
 		defer router.WaitPendingNotifications()
 		if err := router.Send(msg); err != nil {

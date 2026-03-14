@@ -430,11 +430,63 @@ exec codex "$@"
 The wrapper runs `gt prime` before `exec`-ing the real agent binary. Users
 install it as `gt-codex` in their PATH.
 
+### Experimental Codex hooks via custom profile
+
+Gas Town also supports an experimental opt-in Codex hooks path for users who define a custom Codex agent profile with explicit hook settings.
+
+Use this only when both of these are true:
+- Your custom agent profile sets `prompt_mode: "arg"` plus `hooks.provider: "codex"`, `hooks.dir: ".codex"`, and `hooks.settings_file: "hooks.json"`
+- Codex has its upstream hooks feature enabled via `[features].codex_hooks = true`
+
+This installs `.codex/hooks.json` through the existing provider installer path and keeps the implementation intentionally small:
+- `SessionStart` runs `gt prime --hook`
+- Autonomous `SessionStart` also runs `gt mail check --inject`
+- `Stop` runs `gt costs record`
+
+Example custom profile:
+
+```json
+{
+  "agents": {
+    "codex-worker-hooks": {
+      "command": "codex",
+      "args": ["--dangerously-bypass-approvals-and-sandbox"],
+      "prompt_mode": "arg",
+      "hooks": {
+        "provider": "codex",
+        "dir": ".codex",
+        "settings_file": "hooks.json"
+      }
+    }
+  }
+}
+```
+
+This path does not attempt broader hook parity such as tool guards, prompt-submit hooks, or pre-compact behavior.
+
+The default built-in `codex` preset does not change. It remains on the no-hooks fallback path, and the `gt-codex` wrapper guidance above still applies to that default path unless you explicitly opt into a custom hook-capable Codex profile.
+
 ### Slash commands
 
 Gas Town provisions slash commands (like `/commit`, `/handoff`) into agent
 config directories. If your agent reads commands from a config directory,
 set `config_dir` in the preset and Gas Town will provision commands there.
+
+---
+
+## Capability Matrix
+
+Current agent capabilities at a glance:
+
+| Agent | Hooks | Resume | Non-Interactive | Fork | Prompt Mode | Process Names |
+|-------|-------|--------|-----------------|------|-------------|---------------|
+| Claude | Yes (settings.json) | `--resume` (flag) | Native | Yes | arg | node, claude |
+| Gemini | Yes | `--resume` (flag) | `-p` | No | arg | gemini |
+| Codex | No | `resume` (subcmd) | `exec` subcmd | No | none | codex |
+| Cursor | No | `--resume` (flag) | `-p` | No | arg | cursor-agent |
+| Auggie | No | `--resume` (flag) | No | No | arg | auggie |
+| AMP | No | `threads continue` (subcmd) | No | No | arg | amp |
+| OpenCode | Yes (plugin JS) | No | `run` subcmd | No | none | opencode, node, bun |
 
 ---
 
@@ -508,6 +560,31 @@ interface AgentProvider {
 **Bottom line**: If you integrate at Tier 1 today (JSON preset), you're already
 90% of the way to the Gas City contract. The JSON fields map directly to the
 provider interface capabilities.
+
+---
+
+## Design Principles
+
+### Discover, Don't Track
+
+Agent liveness is derived from tmux state, not tracked in a database.
+Process names and ready prompts are observed, not self-reported.
+
+### ZFC: Zero Framework Cognition
+
+The agent decides what to do with instructions. Gas Town provides transport
+(tmux, hooks, nudges) but doesn't make decisions for agents. The interface
+is about communication channels, not control flow.
+
+### Graceful Degradation
+
+Every capability has a fallback:
+- No hooks? -> Startup fallback commands via tmux
+- No prompt mode? -> Nudge delivery
+- No resume? -> Fresh session with handoff mail
+- No process API? -> Tmux pane_current_command
+
+The system works (less reliably) with zero native API support.
 
 ---
 

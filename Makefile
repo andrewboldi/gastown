@@ -1,8 +1,14 @@
-.PHONY: build install clean test test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install check-forward-only clean test test-e2e-container check-up-to-date
 
 BINARY := gt
+BINARY_DESKTOP := gt-desktop
 BUILD_DIR := .
 INSTALL_DIR := $(HOME)/.local/bin
+E2E_IMAGE ?= gastown-test
+E2E_BUILD_FLAGS ?=
+E2E_RUN_FLAGS ?= --rm
+E2E_BUILD_RETRIES ?= 1
+E2E_RUN_RETRIES ?= 1
 
 # Get version info for ldflags
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -26,14 +32,32 @@ ifeq ($(shell uname),Darwin)
 endif
 
 build:
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-proxy-server ./cmd/gt-proxy-server
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-proxy-client ./cmd/gt-proxy-client
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gt
 ifeq ($(shell uname),Darwin)
+	@codesign -s - -f $(BUILD_DIR)/$(BINARY)-proxy-server 2>/dev/null || true
+	@echo "Signed $(BINARY)-proxy-server for macOS"
+	@codesign -s - -f $(BUILD_DIR)/$(BINARY)-proxy-client 2>/dev/null || true
+	@echo "Signed $(BINARY)-proxy-client for macOS"
 	@codesign -s - -f $(BUILD_DIR)/$(BINARY) 2>/dev/null || true
 	@echo "Signed $(BINARY) for macOS"
 endif
 
+desktop-build:
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_DESKTOP) ./cmd/gt-desktop
+ifeq ($(shell uname),Darwin)
+	@codesign -s - -f $(BUILD_DIR)/$(BINARY_DESKTOP) 2>/dev/null || true
+	@echo "Signed $(BINARY_DESKTOP) for macOS"
+endif
+
+desktop-run:
+	go run ./cmd/gt-desktop
+
 check-up-to-date:
 ifndef SKIP_UPDATE_CHECK
+	@# Skip check on detached HEAD (tag checkouts, CI builds)
+	@if ! git symbolic-ref HEAD >/dev/null 2>&1; then exit 0; fi
 	@git fetch origin main --quiet 2>/dev/null || true
 	@LOCAL=$$(git rev-parse HEAD 2>/dev/null); \
 	REMOTE=$$(git rev-parse origin/main 2>/dev/null); \
@@ -43,6 +67,30 @@ ifndef SKIP_UPDATE_CHECK
 		echo "  Remote: $$(git rev-parse --short origin/main)"; \
 		echo "Run 'git pull' first, or use SKIP_UPDATE_CHECK=1 to override"; \
 		exit 1; \
+	fi
+endif
+
+# check-forward-only: Ensure HEAD is a descendant of the currently installed binary's commit.
+# Prevents rebuilding to an older or diverged commit, which caused a crash loop where
+# the replaced binary broke session startup hooks → witness respawned → loop every 1-2 min.
+check-forward-only:
+ifndef SKIP_FORWARD_CHECK
+	@BINARY_COMMIT=$$($(INSTALL_DIR)/$(BINARY) version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@'); \
+	if [ -n "$$BINARY_COMMIT" ] && [ "$$BINARY_COMMIT" != "unknown" ]; then \
+		HEAD_COMMIT=$$(git rev-parse HEAD 2>/dev/null); \
+		if [ "$$BINARY_COMMIT" = "$$HEAD_COMMIT" ] || [ "$$(git rev-parse --short HEAD)" = "$$BINARY_COMMIT" ]; then \
+			echo "Binary is already at HEAD, nothing to do"; \
+			exit 1; \
+		fi; \
+		if ! git merge-base --is-ancestor "$$BINARY_COMMIT" HEAD 2>/dev/null; then \
+			echo "ERROR: HEAD ($$(git rev-parse --short HEAD)) is NOT a descendant of installed binary ($$BINARY_COMMIT)"; \
+			echo "This would be a DOWNGRADE. Refusing to rebuild."; \
+			echo "Use SKIP_FORWARD_CHECK=1 to override (dangerous)."; \
+			exit 1; \
+		fi; \
+		echo "Forward-only check passed: $$BINARY_COMMIT → $$(git rev-parse --short HEAD)"; \
+	else \
+		echo "Warning: cannot determine installed binary commit, skipping forward check"; \
 	fi
 endif
 
@@ -68,6 +116,28 @@ install: check-up-to-date build
 			echo "Daemon restarted." || \
 			echo "Warning: daemon restart failed (start manually with: gt daemon start)"; \
 	fi
+	@# Sync plugins from build repo to town runtime directories.
+	@# Prevents drift when plugin fixes merge but runtime dirs are stale.
+	@$(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
+		echo "Plugins synced." || true
+
+# safe-install: Replace binary WITHOUT restarting daemon or killing sessions.
+# Use this for automated rebuilds (e.g., rebuild-gt plugin). Sessions pick up
+# the new binary on their next natural cycle/handoff.
+safe-install: check-up-to-date check-forward-only build
+	@mkdir -p $(INSTALL_DIR)
+	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
+	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
+	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
+	@# Nuke any stale go-install binaries that shadow the canonical location
+	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
+		if [ -f "$$bad" ]; then \
+			echo "Removing stale $$bad (use make install, not go install)"; \
+			rm -f "$$bad"; \
+		fi; \
+	done
+	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
+	@echo "Sessions will pick up new binary on next cycle."
 
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
@@ -77,5 +147,24 @@ test:
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:
-	docker build -f Dockerfile.e2e -t gastown-test .
-	docker run --rm gastown-test
+ifeq ($(OS),Windows_NT)
+	@powershell -NoProfile -Command "$$max=$(E2E_BUILD_RETRIES); for($$i=1; $$i -le $$max; $$i++){ docker build $(E2E_BUILD_FLAGS) -f Dockerfile.e2e -t $(E2E_IMAGE) .; if($$LASTEXITCODE -eq 0){ break }; if($$i -eq $$max){ exit 1 }; Write-Host ('docker build failed (attempt ' + $$i + '), retrying...'); Start-Sleep -Seconds 2 }"
+	@powershell -NoProfile -Command "$$max=$(E2E_RUN_RETRIES); for($$i=1; $$i -le $$max; $$i++){ docker run $(E2E_RUN_FLAGS) $(E2E_IMAGE); if($$LASTEXITCODE -eq 0){ break }; if($$i -eq $$max){ exit 1 }; Write-Host ('docker run failed (attempt ' + $$i + '), retrying...'); Start-Sleep -Seconds 2 }"
+else
+	@attempt=1; \
+	while [ $$attempt -le $(E2E_BUILD_RETRIES) ]; do \
+		docker build $(E2E_BUILD_FLAGS) -f Dockerfile.e2e -t $(E2E_IMAGE) . && break; \
+		if [ $$attempt -eq $(E2E_BUILD_RETRIES) ]; then exit 1; fi; \
+		echo "docker build failed (attempt $$attempt), retrying..."; \
+		attempt=$$((attempt+1)); \
+		sleep 2; \
+	done
+	@attempt=1; \
+	while [ $$attempt -le $(E2E_RUN_RETRIES) ]; do \
+		docker run $(E2E_RUN_FLAGS) $(E2E_IMAGE) && break; \
+		if [ $$attempt -eq $(E2E_RUN_RETRIES) ]; then exit 1; fi; \
+		echo "docker run failed (attempt $$attempt), retrying..."; \
+		attempt=$$((attempt+1)); \
+		sleep 2; \
+	done
+endif

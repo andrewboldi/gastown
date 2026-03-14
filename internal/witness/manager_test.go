@@ -8,22 +8,24 @@ import (
 )
 
 func TestBuildWitnessStartCommand_UsesRoleConfig(t *testing.T) {
-	roleConfig := &beads.RoleConfig{
+	t.Parallel()
+	roleCfg := &beads.RoleConfig{
 		StartCommand: "exec run --town {town} --rig {rig} --role {role}",
 	}
 
-	got, err := buildWitnessStartCommand("/town/rig", "gastown", "/town", "", "", roleConfig)
+	got, err := buildWitnessStartCommand("/town/rig", "gastown", "/town", "", "", roleCfg)
 	if err != nil {
 		t.Fatalf("buildWitnessStartCommand: %v", err)
 	}
 
-	want := "exec run --town /town --rig gastown --role witness"
+	want := "exec env -u CLAUDECODE NODE_OPTIONS='' run --town /town --rig gastown --role witness"
 	if got != want {
 		t.Errorf("buildWitnessStartCommand = %q, want %q", got, want)
 	}
 }
 
 func TestBuildWitnessStartCommand_DefaultsToRuntime(t *testing.T) {
+	t.Parallel()
 	got, err := buildWitnessStartCommand("/town/rig", "gastown", "/town", "", "", nil)
 	if err != nil {
 		t.Fatalf("buildWitnessStartCommand: %v", err)
@@ -37,12 +39,42 @@ func TestBuildWitnessStartCommand_DefaultsToRuntime(t *testing.T) {
 	}
 }
 
+// TestRoleConfigEnvVars_ExpandsQualifiedGTRole verifies that the TOML env vars
+// expand GT_ROLE to a qualified value (e.g., "gastown/witness" not "witness").
+func TestRoleConfigEnvVars_ExpandsQualifiedGTRole(t *testing.T) {
+	t.Parallel()
+	roleCfg := &beads.RoleConfig{
+		EnvVars: map[string]string{
+			"GT_ROLE":  "{rig}/witness",
+			"GT_SCOPE": "rig",
+		},
+	}
+
+	got := roleConfigEnvVars(roleCfg, "/town", "gastown")
+	if got["GT_ROLE"] != "gastown/witness" {
+		t.Errorf("GT_ROLE = %q, want %q", got["GT_ROLE"], "gastown/witness")
+	}
+	if got["GT_SCOPE"] != "rig" {
+		t.Errorf("GT_SCOPE = %q, want %q", got["GT_SCOPE"], "rig")
+	}
+}
+
+// TestRoleConfigEnvVars_NilConfig verifies nil roleConfig returns nil.
+func TestRoleConfigEnvVars_NilConfig(t *testing.T) {
+	t.Parallel()
+	got := roleConfigEnvVars(nil, "/town", "gastown")
+	if got != nil {
+		t.Errorf("expected nil for nil roleConfig, got %v", got)
+	}
+}
+
 func TestBuildWitnessStartCommand_AgentOverrideWins(t *testing.T) {
-	roleConfig := &beads.RoleConfig{
+	t.Parallel()
+	roleCfg := &beads.RoleConfig{
 		StartCommand: "exec run --role {role}",
 	}
 
-	got, err := buildWitnessStartCommand("/town/rig", "gastown", "/town", "", "codex", roleConfig)
+	got, err := buildWitnessStartCommand("/town/rig", "gastown", "/town", "", "codex", roleCfg)
 	if err != nil {
 		t.Fatalf("buildWitnessStartCommand: %v", err)
 	}

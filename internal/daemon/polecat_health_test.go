@@ -29,7 +29,7 @@ func writeFakeTestTmux(t *testing.T, dir string) {
 
 // writeFakeTestBD creates a shell script in dir named "bd" that outputs a
 // polecat agent bead JSON. The descState parameter controls what appears in
-// the description text (parsed by ParseAgentFieldsFromDescription), while
+// the description text (parsed by ParseAgentFields), while
 // dbState controls the agent_state database column. updatedAt controls the
 // bead's updated_at timestamp for time-bound testing.
 func writeFakeTestBD(t *testing.T, dir, descState, dbState, hookBead, updatedAt string) string {
@@ -187,8 +187,8 @@ func TestCheckPolecatHealth_DBStateOverridesDescription(t *testing.T) {
 
 // TestCheckPolecatHealth_NotifiesWitnessOnCrash verifies that when a polecat
 // crash is detected, the daemon sends a notification to the witness via
-// `gt mail send` with a CRASHED_POLECAT subject. This ensures the Mayor has
-// visibility into crashes even when auto-restart handles recovery.
+// `gt mail send` with a CRASHED_POLECAT subject. Restart is deferred to the
+// stuck-agent-dog plugin for context-aware recovery.
 func TestCheckPolecatHealth_NotifiesWitnessOnCrash(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks for tmux and bd")

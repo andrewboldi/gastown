@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -91,6 +92,16 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 
+	// Acquire per-bead flock to prevent concurrent dispatch races (TOCTOU).
+	// The CLI path (runSling) has its own flock; this closes the gap where
+	// batch sling and queue dispatch could race against each other or against
+	// a concurrent CLI invocation.
+	releaseLock, err := tryAcquireSlingBeadLock(townRoot, params.BeadID)
+	if err != nil {
+		return &SlingResult{BeadID: params.BeadID, ErrMsg: err.Error()}, err
+	}
+	defer releaseLock()
+
 	beadsDir := params.BeadsDir
 	if beadsDir == "" {
 		beadsDir = filepath.Join(townRoot, ".beads")
@@ -100,10 +111,16 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		BeadID: params.BeadID,
 	}
 
-	// 0. Check if rig is parked before dispatching (gt-4owfd.1)
-	if params.RigName != "" && IsRigParked(townRoot, params.RigName) {
-		result.ErrMsg = "rig parked"
-		return result, fmt.Errorf("cannot sling to parked rig %q\nUnpark with: gt rig unpark %s", params.RigName, params.RigName)
+	// 0. Check if rig is parked or docked before dispatching (gt-4owfd.1, gt-11y)
+	if params.RigName != "" {
+		if blocked, reason := IsRigParkedOrDocked(townRoot, params.RigName); blocked {
+			result.ErrMsg = "rig " + reason
+			undoCmd := "gt rig unpark"
+			if reason == "docked" {
+				undoCmd = "gt rig undock"
+			}
+			return result, fmt.Errorf("cannot sling to %s rig %q\n%s %s", reason, params.RigName, undoCmd, params.RigName)
+		}
 	}
 
 	// 1. Get bead info + status check
@@ -111,6 +128,13 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if err != nil {
 		result.ErrMsg = err.Error()
 		return result, fmt.Errorf("could not get bead info: %w", err)
+	}
+
+	// Guard against dispatching closed/tombstone beads (defense-in-depth).
+	// Not bypassed by --force — if you need to re-dispatch, reopen the bead first.
+	if info.Status == "closed" || info.Status == "tombstone" {
+		result.ErrMsg = "already " + info.Status
+		return result, fmt.Errorf("bead %s is %s (work already completed)", params.BeadID, info.Status)
 	}
 
 	// Save explicit force state before dead-agent auto-force, so the deferred
@@ -171,11 +195,17 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 
-	// 2. Burn stale molecules (if formula and force)
+	// 2. Burn stale molecules (if formula applies)
 	if params.FormulaName != "" {
 		existingMolecules := collectExistingMolecules(info)
 		if len(existingMolecules) > 0 {
-			if params.Force {
+			// Auto-burn when bead is unassigned (molecules are definitionally stale),
+			// or when the assigned agent's session is dead. This unblocks the daemon's
+			// stranded convoy scan which never passes --force.
+			stale := params.Force ||
+				(info.Assignee == "" && (info.Status == "open" || info.Status == "in_progress")) ||
+				(info.Assignee != "" && isHookedAgentDeadFn(info.Assignee))
+			if stale {
 				fmt.Printf("  %s Burning %d stale molecule(s): %s\n",
 					style.Warning.Render("⚠"), len(existingMolecules), strings.Join(existingMolecules, ", "))
 				if err := burnExistingMolecules(existingMolecules, params.BeadID, townRoot); err != nil {
@@ -214,10 +244,12 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	hookWorkDir := spawnInfo.ClonePath
 
 	// 4. Auto-convoy (if !NoConvoy)
+	convoyID := ""
 	if !params.NoConvoy {
 		existingConvoy := isTrackedByConvoy(params.BeadID)
 		if existingConvoy == "" {
-			convoyID, err := createAutoConvoy(params.BeadID, info.Title, params.Owned, params.Merge)
+			var err error
+			convoyID, err = createAutoConvoy(params.BeadID, info.Title, params.Owned, params.Merge, params.BaseBranch)
 			if err != nil {
 				fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 			} else {
@@ -235,7 +267,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		if err := CookFormula(params.FormulaName, workDir, townRoot); err != nil {
 			if params.FormulaFailFatal {
 				// Rollback spawned polecat on fatal cook failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir)
+				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
 				result.ErrMsg = fmt.Sprintf("cook failed: %v", err)
 				return result, fmt.Errorf("cooking formula %s: %w", params.FormulaName, err)
 			}
@@ -248,19 +280,29 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	// 6. Instantiate formula on bead (wisp + bond)
 	beadToHook := params.BeadID
 	attachedMoleculeID := ""
+	var allVars []string
 	if params.FormulaName != "" && formulaCooked {
 		// Auto-inject rig command vars as defaults (user --var flags override)
 		rigCmdVars := loadRigCommandVars(townRoot, params.RigName)
 		// Build per-bead vars: rig defaults first, then user vars (higher priority)
-		allVars := append(rigCmdVars, params.Vars...)
+		allVars = append(rigCmdVars, params.Vars...)
 		if spawnInfo.BaseBranch != "" && spawnInfo.BaseBranch != "main" {
 			allVars = append(allVars, fmt.Sprintf("base_branch=%s", spawnInfo.BaseBranch))
 		}
-		formulaResult, err := InstantiateFormulaOnBead(params.FormulaName, params.BeadID, info.Title, hookWorkDir, townRoot, true, allVars)
+
+		// GH#gt-zqvj: Inject prior attempt context when re-dispatching an issue
+		// that already has an open MR from a previous polecat. The new polecat
+		// gets the old branch name so it can cherry-pick prior work instead of
+		// starting from scratch.
+		if priorVars := lookupPriorAttempt(beadsDir, params.BeadID); len(priorVars) > 0 {
+			allVars = append(allVars, priorVars...)
+			fmt.Printf("  %s Prior attempt found — context injected for polecat\n", style.Dim.Render("↻"))
+		}
+		formulaResult, err := InstantiateFormulaOnBead(context.Background(), params.FormulaName, params.BeadID, info.Title, hookWorkDir, townRoot, true, allVars)
 		if err != nil {
 			if params.FormulaFailFatal {
 				// Rollback spawned polecat on fatal formula failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir)
+				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
 				result.ErrMsg = fmt.Sprintf("formula failed: %v", err)
 				return result, fmt.Errorf("instantiating formula %s: %w", params.FormulaName, err)
 			}
@@ -279,7 +321,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
 	if err := hookBeadWithRetry(beadToHook, targetAgent, hookDir); err != nil {
 		// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
-		cleanupSpawnedPolecat(spawnInfo, params.RigName)
+		cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
 		result.ErrMsg = "hook failed"
 		return result, fmt.Errorf("failed to hook bead: %w", err)
 	}
@@ -297,9 +339,12 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             params.Args,
+		Vars:             append([]string(nil), params.Vars...),
 		AttachedMolecule: attachedMoleculeID,
+		AttachedFormula:  params.FormulaName,
 		NoMerge:          params.NoMerge,
 		Mode:             params.Mode,
+		FormulaVars:      strings.Join(allVars, "\n"),
 	}
 	// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
 	if err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {
@@ -315,7 +360,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	pane, err := spawnInfo.StartSession()
 	if err != nil {
 		fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
-		rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir)
+		rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir, convoyID)
 		result.ErrMsg = fmt.Sprintf("session failed: %v", err)
 		return result, fmt.Errorf("starting polecat session: %w", err)
 	}

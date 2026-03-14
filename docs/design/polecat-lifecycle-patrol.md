@@ -3,10 +3,11 @@
 > **Bead:** gt-t6muy
 > **Date:** 2026-02-20
 > **Author:** capable (gastown polecat)
-> **Status:** Design specification
+> **Status:** Implemented — core lifecycle shipped, branch cleanup shipped, mayor notify pending
+> **Updated:** 2026-03-07 (gt-o8g8 implementation audit by bear)
 > **Related:** gt-dtw9u (Witness monitoring), gt-qpwv4 (Completion detection),
 > gt-6qyt1 (Refinery queue), gt-budeb (Auto-nuke), gt-5j3ia (Swarm aggregation),
-> gt-1dbcp (Polecat auto-start)
+> gt-1dbcp (Polecat auto-start), w-gt-004 (Wasteland lifecycle item)
 
 ---
 
@@ -28,34 +29,7 @@ persists across sessions. Sessions are the pistons; sandboxes are the cylinders.
 
 ### 2.1 The Relay Race
 
-A molecule with N steps may use N separate polecat sessions, all operating on the
-same sandbox (git worktree and branch). Each session:
-
-1. Spawns into existing sandbox
-2. Primes context (`gt prime`)
-3. Discovers current step (`bd mol current`)
-4. Executes the step
-5. Closes the step bead (`bd close <step-id>`)
-6. Hands off or exits (`gt handoff` or `gt done`)
-
-```
-Step 1          Step 2          Step 3          Step N
-┌──────┐        ┌──────┐        ┌──────┐        ┌──────┐
-│Sess 1│───────▸│Sess 2│───────▸│Sess 3│──···──▸│Sess N│
-│prime  │        │prime  │        │prime  │        │prime  │
-│work   │        │work   │        │work   │        │work   │
-│close  │        │close  │        │close  │        │close  │
-│handoff│        │handoff│        │handoff│        │gt done│
-└──────┘        └──────┘        └──────┘        └──────┘
-     ▲               ▲               ▲               ▲
-     └───────────────┴───────────────┴───────────────┘
-                Same sandbox (branch + worktree)
-```
-
-**Key invariant:** The sandbox persists through all session cycles AND across
-assignments (persistent polecat model, gt-4ac). `gt done` kills the session and
-sets the polecat to idle, but the sandbox is preserved for reuse. Intermediate
-session cycles are normal operation, not failure recovery.
+See [concepts/polecat-lifecycle.md](../concepts/polecat-lifecycle.md) for the relay race model.
 
 ### 2.2 Session Cycling vs Step Cycling
 
@@ -646,20 +620,45 @@ changes the transport layer but preserves the lifecycle model:
 
 ---
 
-## 10. Summary
+## 10. Implementation Status (gt-o8g8 audit, 2026-03-07)
 
-The polecat lifecycle is a relay race on a persistent track:
+### Shipped
 
-1. **Sessions are ephemeral.** They cycle frequently. This is normal.
-2. **Sandboxes are persistent.** They survive all session cycles and across assignments. Repaired on reuse by `gt sling`.
-3. **Identity is permanent.** The agent bead, CV chain, and work history accumulate forever.
-4. **Cleanup has two stages.** Step cleanup (session dies, sandbox lives) and molecule cleanup (session dies, polecat goes idle, sandbox preserved for reuse).
-5. **The channel is mail.** Lifecycle requests flow through existing `gt mail` to the witness.
-6. **Patrol is redundant.** Daemon, deacon, witness, and refinery all observe overlapping state. This is resilience, not waste.
-7. **Completion is guaranteed.** GUPP + pinned work + witness respawn = eventual completion.
-8. **Self-recycling is preferred.** Polecats manage their own lifecycle. Mechanical intervention is the safety net, not the primary mechanism.
+All core lifecycle operations are implemented and running in production:
 
-The system optimizes for **completion**, not uptime. Individual sessions are cheap.
-Sandboxes are persistent and reusable. Identity is permanent. The lifecycle model
-reflects this: sessions are disposable, sandboxes survive across assignments,
-identity accumulates forever.
+| Operation | Command/Component | Key Implementation |
+|-----------|------------------|-------------------|
+| Spawn/assign | `gt sling` | `sling.go`, `polecat_spawn.go` — finds idle polecat or allocates new slot |
+| Work execution | `gt prime --hook` | Session discovers hook via `bd mol current`, GUPP fires |
+| Session cycling | `gt handoff` | `handoff.go` — all roles, preserves sandbox and identity |
+| Step completion | `bd close` + `gt handoff` | Step cleanup: session dies, sandbox lives |
+| Work submission | `gt done` | `done.go` — push, MR, sandbox sync, set idle |
+| Idle polecat reuse | `gt sling` | `polecat/manager.go`: `FindIdlePolecat()` + `ReuseIdlePolecat()` — branch-only repair |
+| Zombie detection | Witness patrol | `witness/handlers.go`: `DetectZombiePolecats()` — restart-first, no auto-nuke |
+| Stale detection | Witness patrol | `polecat/manager.go`: `DetectStalePolecats()` — tmux-based, protects paused states |
+| Orphan recovery | Witness patrol | `witness/handlers.go`: `DetectOrphanedBeads()` — reset and re-dispatch |
+| Cleanup pipeline | Mail-based | POLECAT_DONE → Witness → MERGE_READY → Refinery → MERGED |
+| Merge queue | Refinery | Squash-merge, close MR and issue, convoy check |
+
+### Pending
+
+| Feature | Description | Impact |
+|---------|-------------|--------|
+| Refinery notifies mayor after merge | PRs #2436/#2437 closed; branch cleanup shipped, mayor notify not yet | Unblocks dependent work dispatch |
+
+### Deferred (design only)
+
+| Feature | Rationale for deferral |
+|---------|----------------------|
+| Pool size enforcement | On-demand allocation works; fixed pool is optimization, not correctness |
+| `gt polecat pool init` | Polecats created naturally by first `gt sling`; pre-allocation unnecessary |
+| `ReconcilePool()` | Witness patrol already detects state drift via zombie/stale/orphan checks |
+
+---
+
+## 11. Summary
+
+See [concepts/polecat-lifecycle.md](../concepts/polecat-lifecycle.md) for the
+complete lifecycle model (three layers, four states, persistent polecat design).
+This document covers the implementation details: cleanup stages, mail channels,
+patrol coordination, and edge case handling.

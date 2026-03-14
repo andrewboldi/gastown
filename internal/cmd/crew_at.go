@@ -68,7 +68,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		fmt.Printf("[DEBUG] after detection: name=%q, crewRig=%q\n", name, crewRig)
 	}
 
-	crewMgr, r, err := getCrewManager(crewRig)
+	crewMgr, r, err := getCrewManagerForMember(crewRig, name)
 	if err != nil {
 		return err
 	}
@@ -116,12 +116,12 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		rc, _, resolveErr := config.ResolveAgentConfigWithOverride(townRoot, r.Path, crewAgentOverride)
 		if resolveErr != nil {
 			style.PrintWarning("could not resolve agent override %q: %v, falling back to default", crewAgentOverride, resolveErr)
-			runtimeConfig = config.ResolveRoleAgentConfig("crew", townRoot, r.Path)
+			runtimeConfig = config.ResolveWorkerAgentConfig(name, townRoot, r.Path)
 		} else {
 			runtimeConfig = rc
 		}
 	} else {
-		runtimeConfig = config.ResolveRoleAgentConfig("crew", townRoot, r.Path)
+		runtimeConfig = config.ResolveWorkerAgentConfig(name, townRoot, r.Path)
 	}
 	if runtimeConfig == nil {
 		runtimeConfig = config.DefaultRuntimeConfig()

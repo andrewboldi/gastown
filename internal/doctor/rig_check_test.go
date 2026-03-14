@@ -3,9 +3,48 @@ package doctor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func installMockBdInitOnly(t *testing.T) {
+	t.Helper()
+
+	binDir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		psPath := filepath.Join(binDir, "bd.ps1")
+		psScript := `$target = Join-Path (Get-Location) '.beads'
+foreach ($arg in $args) {
+  if ($arg -eq 'init') {
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Set-Content -Path (Join-Path $target 'config.yaml') -Value @('prefix: tr', 'issue-prefix: tr-')
+    exit 0
+  }
+}
+exit 0
+`
+		cmdScript := "@echo off\r\npwsh -NoProfile -NoLogo -File \"" + psPath + "\" %*\r\n"
+		if err := os.WriteFile(psPath, []byte(psScript), 0644); err != nil {
+			t.Fatalf("write mock bd ps1: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(binDir, "bd.cmd"), []byte(cmdScript), 0644); err != nil {
+			t.Fatalf("write mock bd cmd: %v", err)
+		}
+	} else {
+		script := `#!/bin/sh
+target="$(pwd)/.beads"
+mkdir -p "$target"
+printf 'prefix: tr\nissue-prefix: tr-\n' > "$target/config.yaml"
+exit 0
+`
+		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+			t.Fatalf("write mock bd: %v", err)
+		}
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
 
 func TestNewBeadsRedirectCheck(t *testing.T) {
 	check := NewBeadsRedirectCheck()
@@ -291,6 +330,8 @@ func TestBeadsRedirectCheck_FixNoOp_LocalBeads(t *testing.T) {
 }
 
 func TestBeadsRedirectCheck_FixInitBeads(t *testing.T) {
+	installMockBdInitOnly(t)
+
 	tmpDir := t.TempDir()
 	rigName := "testrig"
 	rigDir := filepath.Join(tmpDir, rigName)
@@ -475,12 +516,12 @@ func TestBeadsRedirectCheck_FixConflictingLocalBeads(t *testing.T) {
 	rigName := "testrig"
 	rigDir := filepath.Join(tmpDir, rigName)
 
-	// Create tracked beads at mayor/rig/.beads
+	// Create tracked beads at mayor/rig/.beads with config.yaml as data marker
 	trackedBeads := filepath.Join(rigDir, "mayor", "rig", ".beads")
 	if err := os.MkdirAll(trackedBeads, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(trackedBeads, "issues.jsonl"), []byte(`{"id":"tr-1"}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(trackedBeads, "config.yaml"), []byte("prefix: tr\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -489,7 +530,7 @@ func TestBeadsRedirectCheck_FixConflictingLocalBeads(t *testing.T) {
 	if err := os.MkdirAll(localBeads, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(localBeads, "issues.jsonl"), []byte(`{"id":"local-1"}`), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(localBeads, "config.yaml"), []byte("prefix: local\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -505,11 +546,6 @@ func TestBeadsRedirectCheck_FixConflictingLocalBeads(t *testing.T) {
 	// Apply fix - should remove conflicting local beads and create redirect
 	if err := check.Fix(ctx); err != nil {
 		t.Fatalf("Fix failed: %v", err)
-	}
-
-	// Verify local issues.jsonl was removed
-	if _, err := os.Stat(filepath.Join(localBeads, "issues.jsonl")); !os.IsNotExist(err) {
-		t.Error("local issues.jsonl should have been removed")
 	}
 
 	// Verify redirect was created

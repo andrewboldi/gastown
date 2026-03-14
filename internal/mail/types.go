@@ -33,6 +33,9 @@ const (
 	// TypeTask indicates a message requiring action from the recipient.
 	TypeTask MessageType = "task"
 
+	// TypeEscalation indicates a structured escalation copy persisted in mail.
+	TypeEscalation MessageType = "escalation"
+
 	// TypeScavenge indicates optional first-come-first-served work.
 	TypeScavenge MessageType = "scavenge"
 
@@ -83,7 +86,7 @@ type Message struct {
 	// Priority is the message priority.
 	Priority Priority `json:"priority"`
 
-	// Type indicates the message type (task, scavenge, notification, reply).
+	// Type indicates the message type (task, escalation, scavenge, notification, reply).
 	Type MessageType `json:"type"`
 
 	// Delivery specifies how the message is delivered (queue or interrupt).
@@ -139,7 +142,7 @@ type Message struct {
 // NewMessage creates a new message with a generated ID and thread ID.
 func NewMessage(from, to, subject, body string) *Message {
 	return &Message{
-		ID:        generateID(),
+		ID:        GenerateID(),
 		From:      from,
 		To:        to,
 		Subject:   subject,
@@ -155,7 +158,7 @@ func NewMessage(from, to, subject, body string) *Message {
 // NewReplyMessage creates a reply message that inherits the thread from the original.
 func NewReplyMessage(from, to, subject, body string, original *Message) *Message {
 	return &Message{
-		ID:        generateID(),
+		ID:        GenerateID(),
 		From:      from,
 		To:        to,
 		Subject:   subject,
@@ -173,7 +176,7 @@ func NewReplyMessage(from, to, subject, body string, original *Message) *Message
 // Queue messages have no direct recipient - they are claimed by eligible agents.
 func NewQueueMessage(from, queue, subject, body string) *Message {
 	return &Message{
-		ID:        generateID(),
+		ID:        GenerateID(),
 		From:      from,
 		Queue:     queue,
 		Subject:   subject,
@@ -190,7 +193,7 @@ func NewQueueMessage(from, queue, subject, body string) *Message {
 // Channel messages are visible to all readers of the channel.
 func NewChannelMessage(from, channel, subject, body string) *Message {
 	return &Message{
-		ID:        generateID(),
+		ID:        GenerateID(),
 		From:      from,
 		Channel:   channel,
 		Subject:   subject,
@@ -267,9 +270,11 @@ func (m *Message) Validate() error {
 	return nil
 }
 
-// generateID creates a random message ID.
+// GenerateID creates a random message ID for in-memory tracking (notifications, logging).
 // Falls back to time-based ID if crypto/rand fails (extremely rare).
-func generateID() string {
+// NOTE: This ID is NOT passed to bd create — bd auto-generates IDs with the correct
+// database prefix. This is only used for msg.ID in the Message struct.
+func GenerateID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		// Fallback to time-based ID instead of panicking
@@ -399,7 +404,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 	// Convert message type, default to notification
 	msgType := TypeNotification
 	switch MessageType(bm.msgType) {
-	case TypeTask, TypeScavenge, TypeReply:
+	case TypeTask, TypeEscalation, TypeScavenge, TypeReply:
 		msgType = MessageType(bm.msgType)
 	}
 
@@ -527,7 +532,7 @@ func PriorityFromInt(p int) Priority {
 // ParseMessageType parses a message type string, returning TypeNotification for invalid values.
 func ParseMessageType(s string) MessageType {
 	switch MessageType(s) {
-	case TypeTask, TypeScavenge, TypeNotification, TypeReply:
+	case TypeTask, TypeEscalation, TypeScavenge, TypeNotification, TypeReply:
 		return MessageType(s)
 	default:
 		return TypeNotification

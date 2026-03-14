@@ -2,11 +2,15 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/wisp"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -58,4 +62,124 @@ func getRig(rigName string) (string, *rig.Rig, error) {
 	}
 
 	return townRoot, r, nil
+}
+
+// hasRigBeadLabel checks if a rig's identity bead has a specific label.
+// Returns false if the rig config or bead can't be loaded (safe default).
+func hasRigBeadLabel(townRoot, rigName, label string) bool {
+	rigPath := filepath.Join(townRoot, rigName)
+	prefix := rigBeadsPrefix(townRoot, rigPath, rigName)
+	if prefix == "" {
+		return false
+	}
+
+	beadsPath := filepath.Join(rigPath, "mayor", "rig")
+	if _, err := os.Stat(beadsPath); err != nil {
+		beadsPath = rigPath
+	}
+
+	bd := beads.New(beadsPath)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
+
+	rigBead, err := bd.Show(rigBeadID)
+	if err != nil {
+		return false
+	}
+
+	for _, l := range rigBead.Labels {
+		if l == label {
+			return true
+		}
+	}
+	return false
+}
+
+// IsRigParkedOrDocked checks if a rig is parked or docked by any mechanism
+// (wisp ephemeral state or persistent bead labels). Returns (blocked, reason).
+// This is the single entry point for all dispatch paths (sling, convoy launch,
+// convoy stage) to check rig availability.
+//
+// Parked vs docked asymmetry: parked state is checked in both the wisp layer
+// (ephemeral, set by "gt rig park") and bead labels (persistent fallback for
+// when wisp state is lost during cleanup). Docked state is bead-label only
+// because "gt rig dock" never writes to wisp — it persists exclusively via
+// the rig identity bead's status:docked label.
+func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
+	// Check wisp layer first (fast, local) — only relevant for parked state
+	wispCfg := wisp.NewConfig(townRoot, rigName)
+	if wispCfg.GetString(RigStatusKey) == RigStatusParked {
+		return true, "parked"
+	}
+
+	// Single bead lookup for both parked and docked labels.
+	// Look up the beads prefix from rigs.json (the rig registry), with fallback
+	// to the rig's own config.json for isolated/test scenarios.
+	rigPath := filepath.Join(townRoot, rigName)
+	prefix := rigBeadsPrefix(townRoot, rigPath, rigName)
+	if prefix == "" {
+		return false, ""
+	}
+
+	beadsPath := filepath.Join(rigPath, "mayor", "rig")
+	if _, err := os.Stat(beadsPath); err != nil {
+		beadsPath = rigPath
+	}
+
+	bd := beads.New(beadsPath)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
+	rigBead, err := bd.Show(rigBeadID)
+	if err != nil {
+		return false, ""
+	}
+
+	for _, l := range rigBead.Labels {
+		if l == "status:parked" {
+			return true, "parked"
+		}
+		if l == RigDockedLabel {
+			return true, "docked"
+		}
+	}
+
+	return false, ""
+}
+
+func rigBeadsPrefix(townRoot, rigPath, rigName string) string {
+	rigsConfigPath := constants.MayorRigsPath(townRoot)
+	if rigsConfig, err := config.LoadRigsConfig(rigsConfigPath); err == nil {
+		if entry, ok := rigsConfig.Rigs[rigName]; ok && entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
+			return entry.BeadsConfig.Prefix
+		}
+	}
+
+	rigConfigPath := filepath.Join(rigPath, "config.json")
+	if rigCfg, err := config.LoadRigConfig(rigConfigPath); err == nil && rigCfg.Beads != nil && rigCfg.Beads.Prefix != "" {
+		return rigCfg.Beads.Prefix
+	}
+
+	return ""
+}
+
+// getAllRigs discovers all rigs in the current Gas Town workspace.
+// Returns the list of rigs and any error.
+func getAllRigs() ([]*rig.Rig, error) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
+	}
+
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	rigs, err := rigMgr.DiscoverRigs()
+	if err != nil {
+		return nil, err
+	}
+
+	return rigs, nil
 }

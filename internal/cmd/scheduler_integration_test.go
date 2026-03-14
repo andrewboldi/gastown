@@ -34,16 +34,19 @@ import (
 var schedulerTestCounter atomic.Int32
 
 // initBeadsDBForServer initializes a beads DB that can operate against the
-// shared Dolt test server. Uses local init (bd init --prefix)
-// which reliably creates the schema, then bd auto-detects the running server
-// at runtime for SQL operations.
-//
-// Note: bd init --server (fresh, not migration) fails to create tables in CI.
-// Local init works reliably and bd auto-detects the server for runtime ops.
+// shared Dolt test server. Uses local init (bd init --prefix --server-port)
+// which reliably creates the schema and records the ephemeral port in
+// metadata.json so subsequent bd commands reach the test server.
 func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	t.Helper()
 
-	cmd := exec.Command("bd", "init", "--prefix", prefix)
+	args := []string{"init", "--prefix", prefix}
+	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
+	// instead of defaulting to port 3307.
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		args = append(args, "--server-port", p)
+	}
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
@@ -56,6 +59,10 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
 	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
 		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
+	}
+
+	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
+		t.Fatalf("ensure custom types in %s: %v", dir, err)
 	}
 }
 
@@ -309,7 +316,8 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
 	// This is the core cross-rig link: convoy lives in HQ DB, bead in rig DB.
-	depCmd := exec.Command("bd", "dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json")
+	depArgs := beads.MaybePrependAllowStale([]string{"dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json"})
+	depCmd := exec.Command("bd", depArgs...)
 	depCmd.Dir = hqPath
 	depOut, err := depCmd.Output()
 	if err != nil {
@@ -418,7 +426,8 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	cmd := exec.Command("bd", "list", "--type=convoy", "--json")
+	listArgs := beads.MaybePrependAllowStale([]string{"list", "--type=convoy", "--json"})
+	cmd := exec.Command("bd", listArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -102,32 +103,38 @@ func detectSenderFromRole(role string) string {
 
 	// GT_ROLE is a simple role name, build the full address
 	switch role {
-	case "mayor":
+	case constants.RoleMayor:
 		return "mayor/"
-	case "deacon":
+	case constants.RoleDeacon:
 		return "deacon/"
-	case "polecat":
+	case constants.RolePolecat:
 		polecat := os.Getenv("GT_POLECAT")
 		if rig != "" && polecat != "" {
 			return fmt.Sprintf("%s/%s", rig, polecat)
 		}
 		// Fallback to cwd detection for polecats
 		return detectSenderFromCwd()
-	case "crew":
+	case constants.RoleCrew:
 		crew := os.Getenv("GT_CREW")
 		if rig != "" && crew != "" {
 			return fmt.Sprintf("%s/crew/%s", rig, crew)
 		}
 		// Fallback to cwd detection for crew
 		return detectSenderFromCwd()
-	case "witness":
+	case constants.RoleWitness:
 		if rig != "" {
 			return fmt.Sprintf("%s/witness", rig)
 		}
 		return detectSenderFromCwd()
-	case "refinery":
+	case constants.RoleRefinery:
 		if rig != "" {
 			return fmt.Sprintf("%s/refinery", rig)
+		}
+		return detectSenderFromCwd()
+	case "dog":
+		dogName := os.Getenv("GT_DOG_NAME")
+		if dogName != "" {
+			return fmt.Sprintf("deacon/dogs/%s", dogName)
 		}
 		return detectSenderFromCwd()
 	default:
@@ -157,6 +164,15 @@ func detectSenderFromCwd() string {
 			polecatPath := strings.Split(parts[1], "/")[0]
 			rigName := filepath.Base(rigPath)
 			return fmt.Sprintf("%s/polecats/%s", rigName, polecatPath)
+		}
+	}
+
+	// If in deacon's dogs directory, extract address (format: deacon/dogs/name)
+	if strings.Contains(cwd, "/deacon/dogs/") {
+		parts := strings.Split(cwd, "/deacon/dogs/")
+		if len(parts) >= 2 {
+			dogName := strings.Split(parts[1], "/")[0]
+			return fmt.Sprintf("deacon/dogs/%s", dogName)
 		}
 	}
 
@@ -232,25 +248,29 @@ func identityFromAgentFile(parsed agentIdentityFile) string {
 	name := strings.TrimSpace(parsed.Name)
 
 	switch role {
-	case "mayor":
+	case constants.RoleMayor:
 		return "mayor/"
-	case "deacon":
+	case constants.RoleDeacon:
 		return "deacon/"
-	case "witness":
+	case constants.RoleWitness:
 		if rig != "" {
 			return fmt.Sprintf("%s/witness", rig)
 		}
-	case "refinery":
+	case constants.RoleRefinery:
 		if rig != "" {
 			return fmt.Sprintf("%s/refinery", rig)
 		}
-	case "crew":
+	case constants.RoleCrew:
 		if rig != "" && name != "" {
 			return fmt.Sprintf("%s/crew/%s", rig, name)
 		}
-	case "polecat":
+	case constants.RolePolecat:
 		if rig != "" && name != "" {
 			return fmt.Sprintf("%s/polecats/%s", rig, name)
+		}
+	case "dog":
+		if name != "" {
+			return fmt.Sprintf("deacon/dogs/%s", name)
 		}
 	}
 

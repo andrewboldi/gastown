@@ -173,7 +173,7 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	if !opts.NoConvoy {
 		existingConvoy := isTrackedByConvoy(beadID)
 		if existingConvoy == "" {
-			convoyID, err := createAutoConvoy(beadID, info.Title, opts.Owned, opts.Merge)
+			convoyID, err := createAutoConvoy(beadID, info.Title, opts.Owned, opts.Merge, opts.BaseBranch)
 			if err != nil {
 				fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 			} else {
@@ -198,7 +198,7 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 
 // runBatchSchedule schedules multiple beads for deferred dispatch.
 // Returns error when all schedule attempts fail.
-func runBatchSchedule(beadIDs []string, rigName string) error {
+func runBatchSchedule(beadIDs []string, rigName, townRoot string) error {
 	if slingDryRun {
 		fmt.Printf("%s Would schedule %d beads to rig '%s':\n", style.Bold.Render("📋"), len(beadIDs), rigName)
 		for _, beadID := range beadIDs {
@@ -211,7 +211,7 @@ func runBatchSchedule(beadIDs []string, rigName string) error {
 
 	successCount := 0
 	for _, beadID := range beadIDs {
-		formula := resolveFormula(slingFormula, slingHookRawBead)
+		formula := resolveFormula(slingFormula, slingHookRawBead, townRoot, rigName)
 		err := scheduleBead(beadID, rigName, ScheduleOptions{
 			Formula:     formula,
 			Args:        slingArgs,
@@ -251,16 +251,31 @@ func resolveRigForBead(townRoot, beadID string) string {
 	return beads.GetRigNameForPrefix(townRoot, prefix)
 }
 
-// resolveFormula determines the formula name from user flags.
-func resolveFormula(explicit string, hookRawBead bool) string {
+// resolveFormula determines the formula name from user flags and rig settings.
+// It checks the rig's workflow.default_formula setting before falling back to
+// the hardcoded "mol-polecat-work" default.
+func resolveFormula(explicit string, hookRawBead bool, townRoot, rigName string) string {
 	if hookRawBead {
 		return ""
 	}
 	if explicit != "" {
 		return explicit
 	}
+	// Check rig's default_formula setting (issue gt-boc).
+	if townRoot != "" && rigName != "" {
+		rigPath := filepath.Join(townRoot, rigName)
+		if df := config.GetDefaultFormula(rigPath); df != "" {
+			return df
+		}
+	}
 	return "mol-polecat-work"
 }
+
+// slingContextTTL is the maximum age of a sling context before it's considered
+// stale and ignored by areScheduled(). This prevents orphaned sling contexts
+// (from failed spawns or throttled dispatches) from permanently blocking tasks.
+// See GH#2279.
+const slingContextTTL = 30 * time.Minute
 
 // areScheduled returns a set of bead IDs that have open sling contexts.
 // Queries HQ only — sling contexts are always created in the town-root DB,
@@ -268,6 +283,9 @@ func resolveFormula(explicit string, hookRawBead bool) string {
 // dir succeeds but HQ fails, which would silently return incomplete results.
 // On error, fails closed: treats ALL requested beads as scheduled to prevent
 // false stranded detection and duplicate scheduling attempts.
+//
+// Sling contexts older than slingContextTTL are ignored — they are likely
+// orphans from failed spawn attempts (GH#2279).
 func areScheduled(beadIDs []string) map[string]bool {
 	result := make(map[string]bool)
 	if len(beadIDs) == 0 {
@@ -295,9 +313,20 @@ func areScheduled(beadIDs []string) map[string]bool {
 		return result
 	}
 
-	// Build lookup of work bead IDs from open contexts
+	// Build lookup of work bead IDs from open contexts, skipping stale ones.
 	scheduledWorkBeads := make(map[string]bool)
+	now := time.Now()
 	for _, ctx := range contexts {
+		// Skip stale sling contexts (GH#2279): contexts older than the TTL
+		// are likely orphans from failed spawn attempts. Ignoring them allows
+		// the task to appear as "ready" again for re-dispatch.
+		if ctx.CreatedAt != "" {
+			if created, err := time.Parse(time.RFC3339, ctx.CreatedAt); err == nil {
+				if now.Sub(created) > slingContextTTL {
+					continue
+				}
+			}
+		}
 		fields := beads.ParseSlingContextFields(ctx.Description)
 		if fields != nil {
 			scheduledWorkBeads[fields.WorkBeadID] = true

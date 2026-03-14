@@ -1,7 +1,6 @@
 package doctor
 
 import (
-	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -11,35 +10,35 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/formula"
+	"github.com/steveyegge/gastown/internal/plugin"
 )
 
 // PatrolMoleculesExistCheck verifies that patrol formulas are accessible.
 // Patrols use `bd mol wisp <formula-name>` to spawn workflows, so the formulas
 // must exist in the formula search path (.beads/formulas/, ~/.beads/formulas/, or $GT_ROOT/.beads/formulas/).
 type PatrolMoleculesExistCheck struct {
-	BaseCheck
+	FixableCheck
 	missingFormulas map[string][]string // rig -> missing formula names
 }
 
 // NewPatrolMoleculesExistCheck creates a new patrol formulas exist check.
 func NewPatrolMoleculesExistCheck() *PatrolMoleculesExistCheck {
 	return &PatrolMoleculesExistCheck{
-		BaseCheck: BaseCheck{
-			CheckName:        "patrol-molecules-exist",
-			CheckDescription: "Check if patrol formulas are accessible",
-			CheckCategory:    CategoryPatrol,
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "patrol-molecules-exist",
+				CheckDescription: "Check if patrol formulas are accessible",
+				CheckCategory:    CategoryPatrol,
+			},
 		},
 	}
 }
 
 // patrolFormulas are the required patrol formula names.
-var patrolFormulas = []string{
-	"mol-deacon-patrol",
-	"mol-witness-patrol",
-	"mol-refinery-patrol",
-}
+var patrolFormulas = constants.PatrolFormulas()
 
 // Run checks if patrol formulas are accessible.
 func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
@@ -74,7 +73,7 @@ func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
 		if _, statErr := os.Stat(rigPath); os.IsNotExist(statErr) {
 			rigPath = ctx.TownRoot
 		}
-		missing := c.checkPatrolFormulas(rigPath)
+		missing := c.checkPatrolFormulas(rigPath, ctx.TownRoot)
 		if len(missing) > 0 {
 			c.missingFormulas[rigName] = missing
 			details = append(details, fmt.Sprintf("%s: missing %v", rigName, missing))
@@ -87,7 +86,7 @@ func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
 			Status:  StatusWarning,
 			Message: fmt.Sprintf("%d rig(s) missing patrol formulas", len(c.missingFormulas)),
 			Details: details,
-			FixHint: "Formulas should exist in .beads/formulas/ at town or rig level, or in ~/.beads/formulas/",
+			FixHint: "Run 'gt doctor --fix' to provision embedded patrol formulas",
 		}
 	}
 
@@ -99,19 +98,61 @@ func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // checkPatrolFormulas returns missing patrol formula names for a rig.
-func (c *PatrolMoleculesExistCheck) checkPatrolFormulas(rigPath string) []string {
+func (c *PatrolMoleculesExistCheck) checkPatrolFormulas(rigPath string, townRoot string) []string {
 	// Check for formula files directly on the filesystem rather than shelling
 	// out to `bd formula list`, which may not be available in all environments
 	// (e.g., CI). Formulas are provisioned as .formula.toml files in .beads/formulas/.
-	formulasDir := filepath.Join(rigPath, ".beads", "formulas")
+	//
+	// Search the full formula path: rig-level → town-level → user-level,
+	// matching the beads SDK's formula resolution order.
+	homeDir, _ := os.UserHomeDir()
+	searchDirs := []string{
+		filepath.Join(rigPath, ".beads", "formulas"),
+		filepath.Join(townRoot, ".beads", "formulas"),
+	}
+	if homeDir != "" {
+		searchDirs = append(searchDirs, filepath.Join(homeDir, ".beads", "formulas"))
+	}
+
 	var missing []string
 	for _, formulaName := range patrolFormulas {
-		formulaPath := filepath.Join(formulasDir, formulaName+".formula.toml")
-		if _, err := os.Stat(formulaPath); os.IsNotExist(err) {
+		found := false
+		for _, dir := range searchDirs {
+			formulaPath := filepath.Join(dir, formulaName+".formula.toml")
+			if _, err := os.Stat(formulaPath); err == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
 			missing = append(missing, formulaName)
 		}
 	}
 	return missing
+}
+
+// Fix provisions missing patrol formulas from the embedded formula templates.
+// Formulas are written to each rig's .beads/formulas/ directory.
+func (c *PatrolMoleculesExistCheck) Fix(ctx *CheckContext) error {
+	if len(c.missingFormulas) == 0 {
+		return nil
+	}
+
+	var errs []string
+	for rigName := range c.missingFormulas {
+		rigPath := filepath.Join(ctx.TownRoot, rigName)
+		if _, statErr := os.Stat(rigPath); os.IsNotExist(statErr) {
+			rigPath = ctx.TownRoot
+		}
+		if _, err := formula.ProvisionFormulas(rigPath); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", rigName, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("partial fix: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // PatrolHooksWiredCheck verifies that hooks trigger patrol execution.
@@ -232,14 +273,12 @@ func (c *PatrolNotStuckCheck) Run(ctx *CheckContext) *CheckResult {
 	for _, rigName := range rigs {
 		rigPath := filepath.Join(ctx.TownRoot, rigName)
 
-		// Try Dolt database first (canonical source in server mode),
-		// fall back to issues.jsonl for non-Dolt rigs or when Dolt is unavailable.
+		// Query Dolt database (the only supported backend).
 		stuck, err := c.checkStuckWispsDolt(rigPath, rigName)
 		if err != nil {
-			// Dolt query failed — fall back to JSONL
-			beadsDir := beads.ResolveBeadsDir(rigPath)
-			beadsPath := filepath.Join(beadsDir, "issues.jsonl")
-			stuck = c.checkStuckWisps(beadsPath, rigName)
+			// Dolt query failed — report as error rather than silently skipping.
+			stuckWisps = append(stuckWisps, fmt.Sprintf("%s: Dolt query failed: %v", rigName, err))
+			continue
 		}
 		stuckWisps = append(stuckWisps, stuck...)
 	}
@@ -313,44 +352,6 @@ func (c *PatrolNotStuckCheck) checkStuckWispsDolt(rigPath string, rigName string
 	return stuck, nil
 }
 
-// checkStuckWisps returns descriptions of stuck wisps in a rig (JSONL fallback).
-func (c *PatrolNotStuckCheck) checkStuckWisps(issuesPath string, rigName string) []string {
-	file, err := os.Open(issuesPath)
-	if err != nil {
-		return nil // No issues file
-	}
-	defer file.Close()
-
-	var stuck []string
-	cutoff := time.Now().Add(-c.stuckThreshold)
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		var issue struct {
-			ID        string    `json:"id"`
-			Title     string    `json:"title"`
-			Status    string    `json:"status"`
-			UpdatedAt time.Time `json:"updated_at"`
-		}
-		if err := json.Unmarshal([]byte(line), &issue); err != nil {
-			continue
-		}
-
-		// Check for in_progress issues older than threshold
-		if issue.Status == "in_progress" && !issue.UpdatedAt.IsZero() && issue.UpdatedAt.Before(cutoff) {
-			stuck = append(stuck, fmt.Sprintf("%s: %s (%s) - stale since %s",
-				rigName, issue.ID, issue.Title, issue.UpdatedAt.Format("2006-01-02 15:04")))
-		}
-	}
-
-	return stuck
-}
-
 // PatrolPluginsAccessibleCheck verifies plugin directories exist and are readable.
 type PatrolPluginsAccessibleCheck struct {
 	FixableCheck
@@ -416,6 +417,95 @@ func (c *PatrolPluginsAccessibleCheck) Fix(ctx *CheckContext) error {
 		}
 	}
 	return nil
+}
+
+// PatrolPluginDriftCheck detects when runtime plugins are out of sync with source.
+type PatrolPluginDriftCheck struct {
+	FixableCheck
+	sourceDir string
+	targetDir string
+}
+
+// NewPatrolPluginDriftCheck creates a new plugin drift check.
+func NewPatrolPluginDriftCheck() *PatrolPluginDriftCheck {
+	return &PatrolPluginDriftCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "patrol-plugin-drift",
+				CheckDescription: "Check if runtime plugins match source repo",
+				CheckCategory:    CategoryPatrol,
+			},
+		},
+	}
+}
+
+// Run checks for plugin drift between source and runtime.
+func (c *PatrolPluginDriftCheck) Run(ctx *CheckContext) *CheckResult {
+	c.targetDir = filepath.Join(ctx.TownRoot, "plugins")
+
+	sourceDir, err := plugin.FindGastownSource(ctx.TownRoot)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "Plugin source not found (skipping drift check)",
+		}
+	}
+	c.sourceDir = sourceDir
+
+	// Skip if source and target are the same directory
+	srcAbs, _ := filepath.Abs(sourceDir)
+	tgtAbs, _ := filepath.Abs(c.targetDir)
+	if srcAbs == tgtAbs {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "Source and runtime are same directory",
+		}
+	}
+
+	report, err := plugin.DetectDrift(sourceDir, c.targetDir)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusError,
+			Message: "Failed to check plugin drift",
+			Details: []string{err.Error()},
+		}
+	}
+
+	if !report.HasDrift() {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "Runtime plugins match source",
+		}
+	}
+
+	var details []string
+	for _, d := range report.Drifted {
+		details = append(details, fmt.Sprintf("%s: content differs", d.Name))
+	}
+	for _, name := range report.Missing {
+		details = append(details, fmt.Sprintf("%s: missing from runtime", name))
+	}
+
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("%d plugin(s) out of sync", len(report.Drifted)+len(report.Missing)),
+		Details: details,
+		FixHint: "Run 'gt plugin sync' to update runtime plugins",
+	}
+}
+
+// Fix syncs plugins from source to runtime.
+func (c *PatrolPluginDriftCheck) Fix(ctx *CheckContext) error {
+	if c.sourceDir == "" || c.targetDir == "" {
+		return fmt.Errorf("drift check did not run; cannot fix")
+	}
+	_, err := plugin.SyncPlugins(c.sourceDir, c.targetDir, false)
+	return err
 }
 
 // discoverRigs finds all registered rigs.

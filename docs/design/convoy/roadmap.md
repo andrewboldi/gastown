@@ -7,23 +7,7 @@ workflows and fixing the reliability problems people actually hit.
 
 ## Current state
 
-The convoy-manager-rewrite landed on upstream/main (PR [#1615](https://github.com/steveyegge/gastown/pull/1615), merged).
-Safety-critical feeder guards are in PR [#1759](https://github.com/steveyegge/gastown/pull/1759) (open, awaiting review).
-
-| Item | Status | What it does |
-|------|--------|-------------|
-| Convoy-manager-rewrite | **Merged** (upstream/main) | Multi-rig event polling, continuation feeding, stranded scan auto-dispatch, observer consolidation, process group isolation |
-| Feeder safety guards | **PR [#1759](https://github.com/steveyegge/gastown/pull/1759)** (open) | Type filtering (`IsSlingableType`), blocks dep checking (`isIssueBlocked`), dispatch failure iteration |
-| Capacity plumbing | Deferred | `isRigAtCapacity` callback — no runtime effect until Phase 2 commands exist |
-| Staged statuses | Deferred | `staged_ready`, `staged_warnings` — no command creates them yet |
-
-Three PRDs written:
-
-| PRD | Status | Scope |
-|-----|--------|-------|
-| Phase 1 (feeder redesign) | Safety items in PR [#1759](https://github.com/steveyegge/gastown/pull/1759), capacity/staged deferred | Type filtering, blocks deps, capacity, iteration, staged statuses |
-| Phase 2 (stage/launch) | Designed | `gt convoy stage`, `gt convoy launch`, epic status management, wave display |
-| Phase 3 (advanced dispatch) | Designed | FeederStrategy interface, coordinator polecat, depth validation, auto-formula |
+Milestone 0 complete -- all foundation PRs merged.
 
 ---
 
@@ -145,84 +129,11 @@ Fixing them benefits the entire system.
 
 ---
 
-## Merge decision (resolved)
-
-The rewrite (PR [#1615](https://github.com/steveyegge/gastown/pull/1615)) was merged to upstream/main by the maintainer with
-all 10 commits under l0g1x authorship. The maintainer added 2 review
-followup commits on top (high-water mark seeding, warm-up polling, error
-logging improvements).
-
-The 3 safety-critical Phase 1 items were extracted into a follow-up PR
-([#1759](https://github.com/steveyegge/gastown/pull/1759)) rather than merged into the rewrite:
-
-| Phase 1 item | Decision | PR |
-|-------------|----------|-----|
-| Type filtering (`IsSlingableType`) | Extracted into follow-up | [#1759](https://github.com/steveyegge/gastown/pull/1759) |
-| Blocks dep checking (`isIssueBlocked`) | Extracted into follow-up | [#1759](https://github.com/steveyegge/gastown/pull/1759) |
-| Iteration past dispatch failures | Extracted into follow-up | [#1759](https://github.com/steveyegge/gastown/pull/1759) |
-| Capacity callback plumbing | Deferred | — |
-| Staged statuses | Deferred | — |
-
-Capacity plumbing and staged statuses add parameter/validation surface
-with no runtime effect until Phase 2 commands exist. They will ship when
-Phase 2 work begins.
-
----
-
 ## Phased plan
 
 ### Milestone 0: Land the foundation
 
-**Goal:** Fix the convoy dispatch infrastructure so existing workflows
-work correctly.
-
-**Status: mostly complete.** The rewrite is merged. Safety guards are in
-PR [#1759](https://github.com/steveyegge/gastown/pull/1759) (awaiting review).
-
-**What shipped (merged):**
-- Multi-rig event polling (fixes cross-rig blindness)
-- Continuation feeding after close events (fixes daemon-doesn't-feed)
-- Stranded scan auto-dispatch (fixes reporting-only limitation)
-- Observer consolidation (removes broken refinery call, removes witness
-  coupling)
-- Process group isolation (prevents orphaned subprocesses)
-- High-water mark seeding on startup (review followup)
-- Warm-up polling to prevent event replay burst (review followup)
-
-**What's in PR [#1759](https://github.com/steveyegge/gastown/pull/1759) (awaiting review):**
-- Type filtering (prevents slinging epics)
-- Blocks dep checking (prevents slinging blocked tasks)
-- Iteration past dispatch failures (prevents stuck convoys)
-- Batch sling single-convoy fix (one convoy per batch, not N)
-- Rig auto-resolution from bead prefixes (deprecates explicit rig arg)
-- ConvoyID/MergeStrategy storage on beads for `gt done` fast path
-
-**What it fixes for Workflow A:**
-- `gt sling <task1> <task2> <task3>` creates **one convoy** tracking all
-  tasks. Rig is auto-resolved from bead prefixes.
-- Blocks deps are respected by the daemon feeder: a blocked task won't
-  be fed until its blocker closes.
-- Type filtering prevents accidental epic slinging.
-- ConvoyID and merge strategy are stored on each bead, enabling `gt done`
-  fast-path convoy lookup.
-
-**What it does NOT fix for Workflow A:**
-- Initial dispatch still sends all tasks regardless of deps (only daemon
-  feeding respects blocks).
-- No convoy-level wave computation (see Milestone 2).
-
-**What it fixes for Workflow B:**
-- Same as Workflow A. design-to-beads creates blocks deps, which are now
-  respected by the feeder.
-
-**What it fixes for Workflow C:**
-- Manual convoys now get reliable daemon-driven feeding with blocks
-  checking. The witness removal doesn't matter because the daemon
-  now handles everything the witness did (and more).
-
-**Remaining action items:**
-1. Fix doc inaccuracies identified in audit (this pass)
-2. Get PR [#1759](https://github.com/steveyegge/gastown/pull/1759) reviewed and merged
+**Status: Complete.**
 
 ### Milestone 1: Pipeline reliability (independent of convoys)
 
@@ -356,12 +267,46 @@ dispatch strategy (Phase 1 feeder with blocks checking) covers the
 common case. The coordinator polecat is for complex epics where
 AI-driven task selection outperforms static dependency ordering.
 
+### Milestone 5: Mountain-Eater (autonomous epic grinding)
+
+**Goal:** Layer agent-driven judgment on top of the mechanical
+ConvoyManager so that large epics grind to completion autonomously.
+
+**Depends on:** Milestone 2 (stage-launch) for the `gt convoy stage/launch`
+pipeline that mountains build on.
+
+**Design doc:** [mountain-eater.md](mountain-eater.md)
+
+**What ships:**
+
+| Component | Description |
+|-----------|-------------|
+| `gt mountain <epic>` | CLI: validate + stage + label + launch |
+| `gt mountain status` | CLI: rich progress view (active, ready, blocked, skipped) |
+| `gt mountain pause/resume/cancel` | CLI: lifecycle management |
+| Witness failure tracking | Patrol step: count polecat failures per convoy issue, auto-skip after 3 |
+| Deacon mountain-audit | Patrol step: periodic progress check, dispatch Dog on stall |
+| `mol-mountain-dog` formula | Dog formula: investigate stall, sling orphaned issues, escalate |
+| ConvoyManager skip-after-N | Global: stranded scan stops re-slinging repeatedly-failed issues |
+| Enhanced convoy status | Global: `gt convoy status` shows active polecats, ready front, blocked issues |
+
+**Key insight:** No agent holds the thread. The `mountain` label on a
+convoy triggers patrol behavior in Witness (failure tracking) and Deacon
+(progress audit). Dogs bring fresh context to stall investigation. The
+ConvoyManager's mechanical feeding handles the happy path; the judgment
+layers handle the 20% that gets stuck.
+
+**Global improvements (benefit all convoys):**
+- Polecat failure tracking (Witness)
+- Skip-after-N-failures in stranded scan (ConvoyManager)
+- Enhanced `gt convoy status` output
+
 ---
 
 ## Dependency graph
 
 ```
-Milestone 0: Foundation  ← rewrite MERGED, safety guards in PR [#1759](https://github.com/steveyegge/gastown/pull/1759)
+Milestone 0: Foundation  ← MERGED
   │
   ├──────────────────────────┐
   │                          │
@@ -369,18 +314,21 @@ Milestone 0: Foundation  ← rewrite MERGED, safety guards in PR [#1759](https:/
 Milestone 1: Pipeline    Milestone 2: Stage/Launch
   (done/refinery fixes)    (gt convoy stage/launch)
   │                          │
-  │                          v
-  │                      Milestone 3: Sub-epic review gate
-  │                          │
-  └──────────┬───────────────┘
-             │
-             v
-         Milestone 4: Advanced dispatch
+  │                          ├───────────────────────┐
+  │                          v                       v
+  │                      Milestone 3: Review gate  Milestone 5: Mountain-Eater
+  │                          │                       │
+  └──────────┬───────────────┘                       │
+             │                                       │
+             v                                       │
+         Milestone 4: Advanced dispatch ◄────────────┘
 ```
 
 Milestones 1 and 2 are independent and can run in parallel.
 Milestone 3 depends on Milestone 2 (needs epic status management).
 Milestone 4 depends on both 2 and 3 being stable.
+Milestone 5 depends on Milestone 2 (uses stage-launch pipeline).
+Milestones 3 and 5 are independent and can run in parallel.
 
 ---
 
@@ -419,8 +367,9 @@ more reliable.
    (fixes "tasks don't land" for everyone). Milestone 2 enables the
    staged convoy UX. These can run in parallel.
 
-3. **After M2:** Milestone 3 (sub-epic review gate) is the key piece
-   connecting design-to-beads output to the full automated workflow.
+3. **After M2:** Milestone 3 (sub-epic review gate) and Milestone 5
+   (Mountain-Eater) can run in parallel. Milestone 5 is the "go to lunch"
+   autonomous grinding feature. Milestone 3 is the review quality gate.
 
 4. **Later:** Milestone 4 (advanced dispatch) when the common case is
    stable.

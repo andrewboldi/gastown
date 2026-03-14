@@ -1,16 +1,19 @@
 package cmd
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/steveyegge/gastown/internal/cli"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -39,6 +42,7 @@ var (
 	installShell      bool
 	installWrappers   bool
 	installSupervisor bool
+	installDoltPort   int
 )
 
 var installCmd = &cobra.Command{
@@ -67,8 +71,9 @@ Examples:
   gt install ~/gt --github=user/repo --public  # Create public GitHub repo
   gt install ~/gt --shell                      # Install shell integration (sets GT_TOWN_ROOT/GT_RIG)
   gt install ~/gt --supervisor                 # Configure launchd/systemd for daemon auto-restart`,
-	Args: cobra.MaximumNArgs(1),
-	RunE: runInstall,
+	Args:         cobra.MaximumNArgs(1),
+	RunE:         runInstall,
+	SilenceUsage: true,
 }
 
 func init() {
@@ -83,6 +88,7 @@ func init() {
 	installCmd.Flags().BoolVar(&installShell, "shell", false, "Install shell integration (sets GT_TOWN_ROOT/GT_RIG env vars)")
 	installCmd.Flags().BoolVar(&installWrappers, "wrappers", false, "Install gt-codex/gt-gemini/gt-opencode wrapper scripts to ~/bin/")
 	installCmd.Flags().BoolVar(&installSupervisor, "supervisor", false, "Configure launchd/systemd for daemon auto-restart")
+	installCmd.Flags().IntVar(&installDoltPort, "dolt-port", 0, "Dolt SQL server port (default 3307; set when another instance owns the default port)")
 	rootCmd.AddCommand(installCmd)
 }
 
@@ -149,6 +155,49 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			if err := doltserver.EnsureDoltIdentity(); err != nil {
 				return fmt.Errorf("dolt identity setup failed (required for beads): %w\n\nTo fix, run:\n  dolt config --global --add user.name \"Your Name\"\n  dolt config --global --add user.email \"you@example.com\"", err)
 			}
+
+			// Preflight: check Dolt port availability before creating any files.
+			// A port conflict would leave a partial install that needs --force to retry.
+			port := doltserver.DefaultPort
+			if installDoltPort != 0 {
+				port = installDoltPort
+				os.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+			} else if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+				if envPort, err := strconv.Atoi(p); err == nil {
+					port = envPort
+				}
+			}
+			if err := doltserver.CheckPortAvailable(port); err != nil {
+				// Port is in use — but if a Dolt server is already running
+				// on it, we can reuse it instead of starting a new one.
+				dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/", port)
+				if db, connErr := sql.Open("mysql", dsn); connErr == nil {
+					if pingErr := db.Ping(); pingErr == nil {
+						db.Close()
+						// Usable Dolt server on this port — skip the check.
+						fmt.Printf("   %s Using existing Dolt server on port %d\n",
+							style.Dim.Render("ℹ"), port)
+						goto portOK
+					}
+					db.Close()
+				}
+				pid, dataDir := doltserver.PortHolder(port)
+				msg := fmt.Sprintf("Dolt port %d is already in use", port)
+				if pid > 0 && dataDir != "" {
+					msg += fmt.Sprintf("\nPort is held by dolt PID %d serving %s", pid, dataDir)
+				} else if pid > 0 {
+					msg += fmt.Sprintf("\nPort is held by PID %d", pid)
+				}
+				msg += "\n\nAnother Gas Town instance is using this port. Specify a free port:"
+				origArgs := strings.Join(os.Args[1:], " ")
+				if freePort := doltserver.FindFreePort(port + 1); freePort > 0 {
+					msg += fmt.Sprintf("\n\n  gt %s --dolt-port %d", origArgs, freePort)
+				} else {
+					msg += fmt.Sprintf("\n\n  gt %s --dolt-port <port>", origArgs)
+				}
+				return fmt.Errorf("%s", msg)
+			}
+		portOK:
 		}
 	}
 
@@ -331,14 +380,15 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			fmt.Printf("   %s Could not initialize town beads: %v\n", style.Dim.Render("⚠"), err)
 		} else {
 			fmt.Printf("   ✓ Initialized .beads/ (town-level beads with hq- prefix)\n")
+		}
 
-			// Provision embedded formulas to .beads/formulas/
-			if count, err := formula.ProvisionFormulas(absPath); err != nil {
-				// Non-fatal: formulas are optional, just convenience
-				fmt.Printf("   %s Could not provision formulas: %v\n", style.Dim.Render("⚠"), err)
-			} else if count > 0 {
-				fmt.Printf("   ✓ Provisioned %d formulas\n", count)
-			}
+		// Provision embedded formulas to .beads/formulas/ even when beads init emitted
+		// warnings. Formula files are static assets and don't require a healthy DB.
+		if count, err := formula.ProvisionFormulas(absPath); err != nil {
+			// Non-fatal: formulas are optional, just convenience
+			fmt.Printf("   %s Could not provision formulas: %v\n", style.Dim.Render("⚠"), err)
+		} else if count > 0 {
+			fmt.Printf("   ✓ Provisioned %d formulas\n", count)
 		}
 
 		// Create town-level agent beads (Mayor, Deacon).
@@ -506,14 +556,50 @@ func writeJSON(path string, data interface{}) error {
 	return os.WriteFile(path, content, 0644)
 }
 
+// buildBdInitArgs returns the arguments for `bd init` including the correct
+// --server-port derived from the town's Dolt configuration.
+func buildBdInitArgs(townPath string) []string {
+	cfg := doltserver.DefaultConfig(townPath)
+	return []string{"init", "--prefix", "hq", "--server",
+		"--server-port", strconv.Itoa(cfg.Port)}
+}
+
 // initTownBeads initializes town-level beads database using bd init.
 // Town beads use the "hq-" prefix for mayor mail and cross-rig coordination.
-// Uses Dolt backend in server mode (Gas Town runs a shared Dolt sql-server).
+// Uses Dolt backend in server mode (Gas Town requires a running Dolt sql-server).
 func initTownBeads(townPath string) error {
+	// Dolt server is required — wait for it to accept queries before proceeding.
+	// The server may have just been started by gt install and TCP reachability
+	// alone is not sufficient; we need MySQL protocol readiness.
+	cfg := doltserver.DefaultConfig(townPath)
+	dsn := fmt.Sprintf("%s@tcp(%s)/", cfg.User, cfg.HostPort())
+	var lastErr error
+	for attempt := 0; attempt < 20; attempt++ {
+		db, err := sql.Open("mysql", dsn)
+		if err == nil {
+			err = db.Ping()
+			db.Close()
+		}
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		time.Sleep(500 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("Dolt server is not ready after 10s: %w", lastErr)
+	}
+
 	// Run: bd init --prefix hq --server
 	// Dolt is the only backend since bd v0.51.0; no --backend flag needed.
 	// Filter inherited BEADS_DIR so bd init targets this town, not a parent .beads.
-	cmd := exec.Command("bd", "init", "--prefix", "hq", "--server")
+	// Always pass --server-port so bd connects to the correct Dolt server.
+	// DefaultConfig resolves the port from config.yaml > GT_DOLT_PORT env > default (3307).
+	// Forward GT_DOLT_PORT so bd connects to the correct server when a
+	// non-default port is configured (e.g., ephemeral test servers in CI).
+	bdInitArgs := buildBdInitArgs(townPath)
+	cmd := exec.Command("bd", bdInitArgs...)
 	cmd.Dir = townPath
 	cmd.Env = withBeadsDirEnv(filepath.Join(townPath, ".beads"))
 
@@ -545,6 +631,15 @@ func initTownBeads(townPath string) error {
 	}
 
 	beadsEnv := withBeadsDirEnv(beadsDir)
+
+	// Set beads.role to maintainer (town-level beads are always maintainer-owned).
+	// Without this, bd doctor warns about missing role configuration.
+	roleSetCmd := exec.Command("bd", "config", "set", "beads.role", "maintainer")
+	roleSetCmd.Dir = townPath
+	roleSetCmd.Env = beadsEnv
+	if roleOutput, roleErr := roleSetCmd.CombinedOutput(); roleErr != nil {
+		fmt.Printf("   %s Could not set beads.role: %s\n", style.Dim.Render("⚠"), strings.TrimSpace(string(roleOutput)))
+	}
 
 	// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
 	prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", "hq")
@@ -665,7 +760,7 @@ func initTownAgentBeads(townPath string) error {
 
 	existingAgents, err := bd.List(beads.ListOptions{
 		Status:   "all",
-		Type:     "agent",
+		Label:    "gt:agent",
 		Priority: -1,
 	})
 	if err != nil {

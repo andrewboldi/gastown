@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -203,17 +204,30 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 		return nil, fmt.Errorf("creating crew dir: %w", err)
 	}
 
-	// Clone the rig repo
+	// Clone the rig repo on the configured default branch.
+	// CloneBranch ensures the crew lands on the rig's default_branch even when
+	// it differs from the remote's HEAD. Falls back gracefully for new/empty repos.
+	defaultBranch := m.rig.DefaultBranch()
 	if m.rig.LocalRepo != "" {
-		if err := m.git.CloneWithReference(m.rig.GitURL, crewPath, m.rig.LocalRepo); err != nil {
-			style.PrintWarning("could not clone with local repo reference: %v", err)
-			if err := m.git.Clone(m.rig.GitURL, crewPath); err != nil {
-				return nil, fmt.Errorf("cloning rig: %w", err)
+		if err := m.git.CloneBranchWithReference(m.rig.GitURL, crewPath, defaultBranch, m.rig.LocalRepo); err != nil {
+			style.PrintWarning("could not clone branch %s with reference: %v", defaultBranch, err)
+			// Try branch without reference (network fetch), then reference without branch
+			if err := m.git.CloneBranch(m.rig.GitURL, crewPath, defaultBranch); err != nil {
+				style.PrintWarning("could not clone branch %s: %v", defaultBranch, err)
+				if err := m.git.CloneWithReference(m.rig.GitURL, crewPath, m.rig.LocalRepo); err != nil {
+					style.PrintWarning("could not clone with reference: %v", err)
+					if err := m.git.Clone(m.rig.GitURL, crewPath); err != nil {
+						return nil, fmt.Errorf("cloning rig: %w", err)
+					}
+				}
 			}
 		}
 	} else {
-		if err := m.git.Clone(m.rig.GitURL, crewPath); err != nil {
-			return nil, fmt.Errorf("cloning rig: %w", err)
+		if err := m.git.CloneBranch(m.rig.GitURL, crewPath, defaultBranch); err != nil {
+			style.PrintWarning("could not clone branch %s, falling back to default: %v", defaultBranch, err)
+			if err := m.git.Clone(m.rig.GitURL, crewPath); err != nil {
+				return nil, fmt.Errorf("cloning rig: %w", err)
+			}
 		}
 	}
 
@@ -230,7 +244,7 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 	}
 
 	crewGit := git.NewGit(crewPath)
-	branchName := m.rig.DefaultBranch()
+	branchName := defaultBranch
 
 	// Optionally create a working branch
 	if createBranch {
@@ -273,6 +287,13 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 		style.PrintWarning("could not copy overlay files: %v", err)
 	}
 
+	// Run setup hooks from .runtime/setup-hooks/.
+	// These hooks can inject local config, copy secrets, or perform other setup tasks.
+	if err := rig.RunSetupHooks(m.rig.Path, crewPath); err != nil {
+		// Non-fatal - log warning but continue
+		style.PrintWarning("could not run setup hooks: %v", err)
+	}
+
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(crewPath); err != nil {
 		// Non-fatal - log warning but continue
@@ -282,7 +303,7 @@ func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error)
 	// Install runtime settings in the shared crew parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 	addTownRoot := filepath.Dir(m.rig.Path)
-	addRuntimeConfig := config.ResolveRoleAgentConfig("crew", addTownRoot, m.rig.Path)
+	addRuntimeConfig := config.ResolveWorkerAgentConfig(name, addTownRoot, m.rig.Path)
 	crewSettingsDir := config.RoleSettingsDir("crew", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(crewSettingsDir, crewPath, "crew", addRuntimeConfig); err != nil {
 		// Non-fatal - log warning but continue
@@ -676,10 +697,20 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		return fmt.Errorf("getting crew worker: %w", err)
 	}
 
+	// Sync remotes (especially pushurl) on every start so that existing crew
+	// clones pick up config changes made after initial creation.
+	if err := m.syncRemotesFromRig(worker.ClonePath); err != nil {
+		// Non-fatal for existing clones: pushurl may not be configured.
+		// Only log when a push URL is expected but sync failed.
+		if m.rig.PushURL != "" {
+			style.PrintWarning("could not sync remotes to crew %s: %v", name, err)
+		}
+	}
+
 	// Ensure runtime settings exist in the shared crew parent directory.
 	// Settings are passed to Claude Code via --settings flag.
 	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("crew", townRoot, m.rig.Path)
+	runtimeConfig := config.ResolveWorkerAgentConfig(name, townRoot, m.rig.Path)
 	crewSettingsDir := config.RoleSettingsDir("crew", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(crewSettingsDir, worker.ClonePath, "crew", runtimeConfig); err != nil {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
@@ -723,10 +754,10 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		}
 
 		// Determine agent preset for resume flag.
-		// Try rig-level agent config first, fall back to "claude".
+		// Try worker-level agent config first, fall back to "claude".
 		agentName := opts.AgentOverride
 		if agentName == "" {
-			if rc := config.ResolveRoleAgentConfig("crew", townRoot, m.rig.Path); rc != nil && rc.Provider != "" {
+			if rc := config.ResolveWorkerAgentConfig(name, townRoot, m.rig.Path); rc != nil && rc.Provider != "" {
 				agentName = rc.Provider
 			} else {
 				agentName = "claude"
@@ -807,6 +838,11 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		return fmt.Errorf("creating session: %w", err)
 	}
 
+	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
+	if paneID, err := t.GetPaneID(sessionID); err == nil {
+		_ = t.SetEnvironment(sessionID, "GT_PANE_ID", paneID)
+	}
+
 	// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.AssignTheme(m.rig.Name)
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, name, "crew")
@@ -817,13 +853,13 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
 	_ = session.TrackSessionPID(townRoot, sessionID, t)
 
-	// Wait for the agent to start, then accept the bypass permissions warning
-	// dialog if it appears. Without this, crew sessions get stuck on the
-	// "Bypass Permissions mode" confirmation dialog.
+	// Wait for the agent to start, then accept any startup dialogs that appear.
+	// Workspace trust dialog is independent of bypass permissions and can appear
+	// for any agent, so we always check for non-interactive sessions.
 	if !opts.Interactive {
 		agentName := opts.AgentOverride
 		if agentName == "" {
-			if rc := config.ResolveRoleAgentConfig("crew", townRoot, m.rig.Path); rc != nil && rc.Provider != "" {
+			if rc := config.ResolveWorkerAgentConfig(name, townRoot, m.rig.Path); rc != nil && rc.Provider != "" {
 				agentName = rc.Provider
 			} else {
 				agentName = "claude"
@@ -836,6 +872,16 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 				style.PrintWarning("timeout waiting for agent to start: %v", err)
 			}
 			_ = t.AcceptStartupDialogs(sessionID)
+		}
+
+		// Start background nudge-queue poller for agents that lack turn-boundary
+		// drain hooks (e.g., Gemini, Codex). Claude drains its queue via
+		// UserPromptSubmit hook so it doesn't need the poller.
+		if preset != nil && !preset.HasTurnBoundaryDrain {
+			if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
+				// Non-fatal — nudges may be delayed but the agent still works.
+				style.PrintWarning("could not start nudge poller for %s: %v", name, pollerErr)
+			}
 		}
 	}
 
@@ -858,6 +904,13 @@ func (m *Manager) Stop(name string) error {
 	}
 	if !running {
 		return ErrSessionNotFound
+	}
+
+	// Stop the background nudge poller before killing the session.
+	// Non-fatal — the poller will exit on its own when the session dies.
+	townRoot := filepath.Dir(m.rig.Path)
+	if pollerErr := nudge.StopPoller(townRoot, sessionID); pollerErr != nil {
+		style.PrintWarning("could not stop nudge poller for %s: %v", name, pollerErr)
 	}
 
 	// Kill the session.

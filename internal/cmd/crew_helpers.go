@@ -6,12 +6,33 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// getCrewManagerForMember returns a crew manager, inferring the rig from the
+// crew member name if cwd-based inference fails. Use this when a crew member
+// name is known (e.g., gt crew at <name>).
+func getCrewManagerForMember(rigName, crewName string) (*crew.Manager, *rig.Rig, error) {
+	if rigName == "" {
+		townRoot, err := workspace.FindFromCwdOrError()
+		if err != nil {
+			return nil, nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+		}
+		rigName, err = inferRigFromCwd(townRoot)
+		if err != nil && crewName != "" {
+			rigName, err = inferRigFromCrewName(townRoot, crewName)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not determine rig (use --rig flag): %w", err)
+		}
+	}
+	return getCrewManager(rigName)
+}
 
 // getCrewManager returns a crew manager for the specified or inferred rig.
 func getCrewManager(rigName string) (*crew.Manager, *rig.Rig, error) {
@@ -83,7 +104,7 @@ func detectCrewFromCwd() (*crewDetection, error) {
 	}
 
 	rigName := parts[0]
-	if parts[1] != "crew" {
+	if parts[1] != constants.RoleCrew {
 		return nil, fmt.Errorf("not in a crew workspace (not in crew/ directory)")
 	}
 	crewName := parts[2]
