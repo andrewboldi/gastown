@@ -161,6 +161,10 @@ func HandlePolecatDone(bd *BdCli, workDir, rigName string, msg *mail.Message, ro
 	// The polecat is idle either way — Mayor should consider slinging next bead. (GH#2727)
 	if result.Handled {
 		notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
+
+		// Extract and store knowledge nugget from this completion.
+		// Best-effort: errors are logged but never block the completion flow.
+		extractAndStoreKnowledge(bd, workDir, rigName, payload)
 	}
 
 	return result
@@ -215,9 +219,18 @@ func HandlePolecatDoneFromBead(bd *BdCli, workDir, rigName, polecatName string, 
 	}
 
 	if hasPendingMR {
-		return handlePolecatDonePendingMR(bd, workDir, rigName, payload, result)
+		result = handlePolecatDonePendingMR(bd, workDir, rigName, payload, result)
+	} else {
+		result = handlePolecatDoneNoMR(workDir, rigName, payload, result)
 	}
-	return handlePolecatDoneNoMR(workDir, rigName, payload, result)
+
+	// Extract and store knowledge nugget from bead-based completion discovery.
+	// Best-effort: errors are logged but never block the completion flow.
+	if result.Handled {
+		extractAndStoreKnowledge(bd, workDir, rigName, payload)
+	}
+
+	return result
 }
 
 // TransitionPolecatToIdle sets a polecat's agent_state to idle after the witness

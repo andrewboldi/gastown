@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/knowledge"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
@@ -204,6 +205,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	outputMoleculeContext(ctx)
 	outputCheckpointContext(ctx)
 	runPrimeExternalTools(cwd)
+	runKnowledgeInject(ctx, hookedBead)
 
 	if ctx.Role == RoleMayor {
 		checkPendingEscalations(ctx)
@@ -501,6 +503,46 @@ func runMailCheckInject(workDir string) {
 	if output != "" {
 		fmt.Println()
 		fmt.Println(output)
+	}
+}
+
+// runKnowledgeInject queries the knowledge base for nuggets relevant to the
+// current hooked work and outputs them as context. This injects institutional
+// learning from prior completions into new agent sessions.
+//
+// Only runs for polecats/crew with hooked work. Skipped in dry-run mode.
+func runKnowledgeInject(ctx RoleContext, hookedBead *beads.Issue) {
+	if primeDryRun {
+		explain(true, "knowledge injection: skipped in dry-run mode")
+		return
+	}
+
+	// Only inject for worker roles with active work
+	if hookedBead == nil {
+		return
+	}
+	if ctx.Role != RolePolecat && ctx.Role != RoleCrew {
+		return
+	}
+
+	// Determine the store directory (same as where witness writes nuggets)
+	storeDir := rigBeadsRoot(ctx)
+	if storeDir == "" {
+		storeDir = ctx.WorkDir
+	}
+
+	store := knowledge.NewStore(storeDir)
+
+	nuggets, err := store.QueryRelevant(hookedBead.Title, hookedBead.Labels, ctx.Rig, 5)
+	if err != nil {
+		// Silently skip — knowledge is best-effort
+		return
+	}
+
+	output := knowledge.FormatForInjection(nuggets)
+	if output != "" {
+		fmt.Println()
+		fmt.Print(output)
 	}
 }
 
