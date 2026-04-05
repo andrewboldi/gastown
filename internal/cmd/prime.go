@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
@@ -242,6 +243,13 @@ func runPrimeCompactResume(ctx RoleContext) {
 	fmt.Println("\n---")
 	fmt.Println()
 	fmt.Println("**Continue your current task.** If you've lost context, run `gt prime` for full reload.")
+
+	// Remind polecats about gt done — after compaction the agent may have lost
+	// the formula checklist and forgotten that gt done is required to submit work.
+	// Without this, polecats finish implementation and sit at the prompt forever.
+	if ctx.Role == RolePolecat {
+		fmt.Printf("\n**IMPORTANT**: When all work is complete (code committed, tests pass), run `%s done` to submit to the merge queue.\n", cli.Name())
+	}
 }
 
 // validatePrimeFlags checks that CLI flag combinations are valid.
@@ -326,20 +334,16 @@ func hookSessionBeaconLines(sessionID, source string) []string {
 // signalAgentReady sets GT_AGENT_READY=1 in the current tmux session environment.
 // Called from the agent's SessionStart hook to signal that the agent has started.
 // WaitForCommand polls for this variable as a ZFC-compliant alternative to
-// probing the process tree via IsAgentAlive. No-op when not in a tmux session.
+// probing the process tree via IsAgentAlive.
+// Uses ResolveCurrentSession to find our session on the town socket — raw
+// exec.Command("tmux", ...) would use the default socket and miss the gastown server.
 func signalAgentReady() {
-	if os.Getenv("TMUX") == "" {
+	t := tmux.NewTmux()
+	name, err := t.ResolveCurrentSession()
+	if err != nil || name == "" {
 		return
 	}
-	out, err := exec.Command("tmux", "display-message", "-p", "#{session_name}").Output()
-	if err != nil {
-		return
-	}
-	session := strings.TrimSpace(string(out))
-	if session == "" {
-		return
-	}
-	_ = exec.Command("tmux", "set-environment", "-t", session, tmux.EnvAgentReady, "1").Run()
+	_ = t.SetEnvironment(name, tmux.EnvAgentReady, "1")
 }
 
 // isCompactResume returns true if the current prime is running after compaction or resume.
@@ -385,8 +389,83 @@ func setupPrimeSession(ctx RoleContext, roleInfo RoleInfo) error {
 	if !roleInfo.Mismatch {
 		ensureBeadsRedirect(ctx)
 	}
+	repairSessionEnv(ctx, roleInfo)
 	emitSessionEvent(ctx)
 	return nil
+}
+
+// repairSessionEnv checks if the tmux session is missing identity env vars
+// and re-injects them from the current role context. This self-heals sessions
+// that were created through non-standard paths or older gt versions. GH#3006.
+func repairSessionEnv(ctx RoleContext, roleInfo RoleInfo) {
+	if os.Getenv("TMUX") == "" {
+		return
+	}
+
+	t := tmux.NewTmux()
+	session, err := t.ResolveCurrentSession()
+	if err != nil || session == "" {
+		return
+	}
+
+	// Quick check: if GT_ROLE is already set in the session env, assume healthy.
+	if _, err := t.GetEnvironment(session, "GT_ROLE"); err == nil {
+		return
+	}
+
+	// Map prime Role type to config.AgentEnv role constant.
+	var agentName string
+	switch ctx.Role {
+	case RoleCrew:
+		agentName = roleInfo.Polecat // RoleInfo.Polecat holds crew member name too
+	case RolePolecat:
+		agentName = roleInfo.Polecat
+	case RoleDog:
+		agentName = roleInfo.Polecat
+	}
+
+	envVars := config.AgentEnv(config.AgentEnvConfig{
+		Role:        string(ctx.Role),
+		Rig:         ctx.Rig,
+		AgentName:   agentName,
+		TownRoot:    ctx.TownRoot,
+		SessionName: session,
+	})
+
+	// Only inject identity-related vars that are missing, not the full AgentEnv
+	// output (which includes Dolt ports, OTEL config, etc. that may have been
+	// intentionally overridden per-session).
+	identitySet := make(map[string]bool, len(config.IdentityEnvVars))
+	for _, k := range config.IdentityEnvVars {
+		identitySet[k] = true
+	}
+	// Also include GT_ROOT and GT_SESSION — core session identity.
+	identitySet["GT_ROOT"] = true
+	identitySet["GT_SESSION"] = true
+
+	var repaired int
+	for k, v := range envVars {
+		if !identitySet[k] {
+			continue
+		}
+		if _, err := t.GetEnvironment(session, k); err == nil {
+			continue // already set at session level
+		}
+		if err := t.SetEnvironment(session, k, v); err == nil {
+			repaired++
+		}
+	}
+
+	if repaired > 0 {
+		fmt.Printf("\n%s Injected %d missing identity vars into session %s\n",
+			style.Bold.Render("⚠️  SESSION ENV REPAIR:"), repaired, session)
+		// Also set in the current process so this prime run uses the correct identity.
+		for k, v := range envVars {
+			if identitySet[k] {
+				os.Setenv(k, v)
+			}
+		}
+	}
 }
 
 // outputRoleContext emits session metadata and all role/context output sections.
@@ -401,6 +480,7 @@ func outputRoleContext(ctx RoleContext) (string, error) {
 		return "", err
 	}
 
+	outputRoleDirectives(ctx, os.Stdout, primeExplain)
 	outputContextFile(ctx)
 	outputHandoffContent(ctx)
 	outputAttachmentStatus(ctx)
@@ -448,34 +528,65 @@ func runBdPrime(workDir string) {
 	}
 }
 
+// memoryTypeLabels maps type keys to human-readable section headers for prime injection.
+var memoryTypeLabels = map[string]string{
+	"feedback":  "Behavioral Rules (from user feedback)",
+	"user":      "User Context",
+	"project":   "Project Context",
+	"reference":  "Reference Links",
+	"general":   "General",
+}
+
 // runMemoryInject loads memories from beads kv and outputs them during prime.
-// This replaces MEMORY.md injection with bead-backed agent memory.
+// Memories are grouped by type and ordered by priority (feedback first).
 func runMemoryInject() {
 	kvs, err := bdKvListJSON()
 	if err != nil {
 		return // Silently skip if kv list fails
 	}
 
-	var memories []string
+	// Group memories by type
+	type mem struct {
+		shortKey string
+		value    string
+	}
+	grouped := make(map[string][]mem)
+
 	for k, v := range kvs {
 		if !strings.HasPrefix(k, memoryKeyPrefix) {
 			continue
 		}
-		shortKey := strings.TrimPrefix(k, memoryKeyPrefix)
-		memories = append(memories, fmt.Sprintf("- **%s**: %s", shortKey, v))
+		memType, shortKey := parseMemoryKey(k)
+		grouped[memType] = append(grouped[memType], mem{shortKey: shortKey, value: v})
 	}
 
-	if len(memories) == 0 {
+	if len(grouped) == 0 {
 		return
 	}
 
-	sort.Strings(memories)
+	// Sort each group by key
+	for t := range grouped {
+		sort.Slice(grouped[t], func(i, j int) bool {
+			return grouped[t][i].shortKey < grouped[t][j].shortKey
+		})
+	}
 
 	fmt.Println()
 	fmt.Println("# Agent Memories")
-	fmt.Println()
-	for _, m := range memories {
-		fmt.Println(m)
+
+	for _, t := range memoryTypeOrder {
+		mems, ok := grouped[t]
+		if !ok || len(mems) == 0 {
+			continue
+		}
+		label := memoryTypeLabels[t]
+		if label == "" {
+			label = t
+		}
+		fmt.Printf("\n## %s\n\n", label)
+		for _, m := range mems {
+			fmt.Printf("- **%s**: %s\n", m.shortKey, m.value)
+		}
 	}
 }
 
@@ -550,9 +661,10 @@ func findAgentWork(ctx RoleContext) (*beads.Issue, error) {
 		return nil, nil
 	}
 
-	// Polecats and crew use a retry loop to handle the timing race where
-	// the hook write (status=hooked + assignee) hasn't propagated to new
-	// Dolt connections by the time gt prime runs on session startup.
+	// Polecats, crew, and dogs use a retry loop to handle the timing race
+	// where the hook write (status=hooked + assignee) hasn't propagated to
+	// new Dolt connections by the time gt prime runs on session startup.
+	// Dogs are especially affected since dispatch is fire-and-forget. (GH#2748)
 	// Uses exponential backoff: 500ms, 1s, 2s, 4s, 8s (total ~15.5s max).
 	// See: https://github.com/steveyegge/gastown/issues/2389
 	//
@@ -560,7 +672,7 @@ func findAgentWork(ctx RoleContext) (*beads.Issue, error) {
 	// A single attempt suffices — retries would add ~15s of latency to
 	// compaction hooks, causing non-Claude runtimes to report hook failure.
 	maxAttempts := 1
-	if (ctx.Role == RolePolecat || ctx.Role == RoleCrew) && !isCompactResume() {
+	if (ctx.Role == RolePolecat || ctx.Role == RoleCrew || ctx.Role == RoleDog) && !isCompactResume() {
 		maxAttempts = 5
 	}
 
@@ -707,6 +819,15 @@ func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMole
 		fmt.Printf("2. Then IMMEDIATELY run: `bd show %s`\n", hookedBead.ID)
 		fmt.Println("3. Begin execution - no waiting for user input")
 	}
+
+	// Polecats MUST call gt done — this is the single most important instruction.
+	// Without it, work lands but sessions accumulate and the merge queue stalls.
+	if ctx.Role == RolePolecat {
+		fmt.Println()
+		fmt.Printf("**⚠️ MANDATORY: When all work is committed, run `%s done` to submit and exit.**\n", cli.Name())
+		fmt.Printf("Do NOT stop at the prompt. Do NOT push to main directly. `%s done` is your final action.\n", cli.Name())
+	}
+
 	fmt.Println()
 	fmt.Println("**DO NOT:**")
 	fmt.Println("- Wait for user response after announcing")
@@ -715,6 +836,10 @@ func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMole
 	fmt.Println("- Check mail first (hook takes priority)")
 	if hasMolecule {
 		fmt.Println("- Skip molecule steps or work on the base bead directly")
+	}
+	if ctx.Role == RolePolecat {
+		fmt.Printf("- Sit idle after committing (run `%s done`)\n", cli.Name())
+		fmt.Println("- Push directly to main (use the merge queue)")
 	}
 	fmt.Println()
 }
@@ -768,10 +893,11 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 
 	// Show inline formula steps from the embedded binary (root-only: no child wisps to query).
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula, strings.Split(attachment.FormulaVars, "\n"))
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
 		fmt.Println()
-		fmt.Printf("%s\n", style.Bold.Render("Work through the checklist above. When all steps complete, run `"+cli.Name()+" done`."))
+		fmt.Printf("%s\n", style.Bold.Render("Work through ALL steps above, including submit and cleanup."))
 		fmt.Println("The base bead is your assignment. The formula steps define your workflow.")
+		fmt.Printf("\n%s\n", style.Bold.Render("REQUIRED: When all steps complete, run `"+cli.Name()+" done` to submit to the merge queue. Do NOT stop after implementation — the formula has submit steps you must follow."))
 		return
 	}
 
@@ -782,44 +908,40 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 	fmt.Println("The base bead is just a container. The molecule steps define your workflow.")
 }
 
-// outputRalphLoopDirective emits the Ralph Wiggum loop command for ralphcat mode.
-// The agent sees this and runs the slash command, activating the Ralph plugin's
-// stop hook loop. Each iteration gets a fresh context window while preserving
-// artifacts on disk via git.
-func outputRalphLoopDirective(_ RoleContext, attachment *beads.AttachmentFields) {
-	fmt.Printf("%s\n\n", style.Bold.Render("## 🐱 RALPH LOOP MODE (RALPHCAT)"))
-	fmt.Println("This work uses Ralph Wiggum loop mode for multi-step execution.")
-	fmt.Println("Each step runs in a fresh context window to avoid context exhaustion.")
+// outputRalphLoopDirective emits inline iterative work instructions for ralph mode.
+// Ralph mode is designed for long, iterative workflows (e.g., quality improvement
+// loops) that benefit from committing progress incrementally. The agent works
+// through formula steps iteratively, committing after each meaningful change,
+// and calls gt done when all acceptance criteria are met or no further progress
+// can be made.
+func outputRalphLoopDirective(ctx RoleContext, attachment *beads.AttachmentFields) {
+	fmt.Printf("%s\n\n", style.Bold.Render("## RALPH LOOP MODE (ITERATIVE WORKFLOW)"))
+	fmt.Println("This work uses iterative loop mode. Work through the steps below,")
+	fmt.Println("committing after each meaningful change. Loop until acceptance criteria")
+	fmt.Println("are met or no further progress can be made.")
 	fmt.Println()
 
-	// Build the ralph prompt from the molecule steps
-	prompt := buildRalphPromptFromMolecule(attachment)
-
-	fmt.Printf("Run this command NOW:\n\n")
-	fmt.Printf("```\n/ralph-loop \"%s\" --max-iterations 20 --completion-phrase \"POLECAT_DONE\"\n```\n\n",
-		strings.ReplaceAll(prompt, "\"", "\\\""))
-
-	fmt.Println("The Ralph loop will:")
-	fmt.Println("1. Execute each step in a fresh context")
-	fmt.Println("2. Preserve work via git commits between steps")
-	fmt.Println("3. Stop when POLECAT_DONE is output or max iterations reached")
-	fmt.Println()
-	fmt.Printf("%s\n", style.Bold.Render("⚠️  Run the /ralph-loop command above. Do NOT work step-by-step manually."))
-}
-
-// buildRalphPromptFromMolecule constructs the Ralph loop prompt text from molecule steps.
-func buildRalphPromptFromMolecule(attachment *beads.AttachmentFields) string {
-	var b strings.Builder
-	b.WriteString("Execute the attached molecule workflow. ")
-	if len(attachment.AttachedVars) > 0 {
-		b.WriteString("Formula vars: " + strings.Join(attachment.AttachedVars, ", ") + ". ")
+	// Show the formula steps inline (same as normal mode) so the agent has
+	// the full checklist. Previously this emitted a /ralph-loop slash command
+	// that didn't exist, causing the polecat to die immediately.
+	if attachment.AttachedFormula != "" {
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
+		fmt.Println()
 	}
+
 	if attachment.AttachedArgs != "" {
-		b.WriteString("Context: " + attachment.AttachedArgs + ". ")
+		fmt.Printf("%s\n", style.Bold.Render("Context:"))
+		fmt.Printf("  %s\n\n", attachment.AttachedArgs)
 	}
-	b.WriteString("Work through steps in order, committing after each. ")
-	b.WriteString("When all steps complete, output POLECAT_DONE.")
-	return b.String()
+
+	fmt.Printf("%s\n", style.Bold.Render("Iterative workflow:"))
+	fmt.Println("1. Work through the formula steps above")
+	fmt.Println("2. Commit after each meaningful change (preserve progress via git)")
+	fmt.Println("3. After completing a pass, evaluate results against acceptance criteria")
+	fmt.Println("4. If criteria not met, loop: identify the worst gap, fix it, commit, re-evaluate")
+	fmt.Println("5. When all criteria are met (or no further progress possible), run `" + cli.Name() + " done`")
+	fmt.Println()
+	fmt.Printf("%s\n", style.Bold.Render("Commit frequently. Each commit preserves your progress."))
 }
 
 // outputBeadPreview runs `bd show` and displays a truncated preview of the bead.

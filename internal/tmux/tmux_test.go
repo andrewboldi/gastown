@@ -506,46 +506,45 @@ func TestIsRuntimeRunning(t *testing.T) {
 
 func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 	tm := newTestTmux(t)
-	sessionName := "gt-test-shell-child-" + t.Name()
 
-	// Clean up any existing session
-	_ = tm.KillSession(sessionName)
+	// Direct path: tmux runs the process as the pane command directly.
+	// This simulates a bundled agent binary (e.g. the standalone claude binary)
+	// where the pane command IS the agent process.
+	t.Run("direct", func(t *testing.T) {
+		sessionName := "gt-test-runtime-direct"
+		_ = tm.KillSession(sessionName)
 
-	// Create session with "bash -c" running a node process
-	// Use a simple node command that runs for a few seconds
-	cmd := `node -e "setTimeout(() => {}, 10000)"`
-	if err := tm.NewSessionWithCommand(sessionName, "", cmd); err != nil {
-		t.Fatalf("NewSessionWithCommand: %v", err)
-	}
-	defer func() { _ = tm.KillSession(sessionName) }()
-
-	// Give the node process time to start
-	// WaitForCommand waits until NOT running bash/zsh/sh
-	shellsToExclude := []string{"bash", "zsh", "sh"}
-	err := tm.WaitForCommand(sessionName, shellsToExclude, 2000*1000000) // 2 second timeout
-	if err != nil {
-		// If we timeout waiting, it means the pane command is still a shell
-		// This is the case we're testing - shell with a node child
-		paneCmd, _ := tm.GetPaneCommand(sessionName)
-		t.Logf("Pane command is %q - testing shell+child detection", paneCmd)
-	}
-
-	// Now test IsRuntimeRunning - it should detect node as a child process
-	processNames := []string{"node", "claude"}
-	paneCmd, _ := tm.GetPaneCommand(sessionName)
-	if paneCmd == "node" {
-		// Direct node detection should work
-		if !tm.IsRuntimeRunning(sessionName, processNames) {
-			t.Error("IsRuntimeRunning should return true when pane command is 'node'")
+		if err := tm.NewSessionWithCommand(sessionName, "", "sleep 10"); err != nil {
+			t.Fatalf("NewSessionWithCommand: %v", err)
 		}
-	} else {
-		// Pane is a shell (bash/zsh) with node as child
-		// The child process detection should catch this
-		got := tm.IsRuntimeRunning(sessionName, processNames)
-		t.Logf("Pane command: %q, IsRuntimeRunning: %v", paneCmd, got)
-		// Note: This may or may not detect depending on how tmux runs the command.
-		// On some systems, tmux runs the command directly; on others via a shell.
-	}
+		defer func() { _ = tm.KillSession(sessionName) }()
+
+		if !tm.IsRuntimeRunning(sessionName, []string{"sleep"}) {
+			paneCmd, _ := tm.GetPaneCommand(sessionName)
+			t.Errorf("IsRuntimeRunning should return true for direct process (pane cmd: %q)", paneCmd)
+		}
+	})
+
+	// Shell+child path: tmux runs a shell which spawns the agent as a child.
+	// This simulates an npm-installed agent (e.g. claude via node) where the
+	// pane command is sh/bash and the agent is a descendant process.
+	t.Run("shell_with_child", func(t *testing.T) {
+		sessionName := "gt-test-runtime-shell-child"
+		_ = tm.KillSession(sessionName)
+
+		if err := tm.NewSessionWithCommand(sessionName, "", "sh -c 'sleep 10'"); err != nil {
+			t.Fatalf("NewSessionWithCommand: %v", err)
+		}
+		defer func() { _ = tm.KillSession(sessionName) }()
+
+		// Give the child process a moment to start
+		time.Sleep(100 * time.Millisecond)
+
+		if !tm.IsRuntimeRunning(sessionName, []string{"sleep"}) {
+			paneCmd, _ := tm.GetPaneCommand(sessionName)
+			t.Errorf("IsRuntimeRunning should return true for child process (pane cmd: %q)", paneCmd)
+		}
+	})
 }
 
 // TestGetPaneCommand_MultiPane verifies that GetPaneCommand returns pane 0's
@@ -973,20 +972,23 @@ func TestCleanupOrphanedSessions(t *testing.T) {
 	_ = tm.KillSession(hqSession)
 	_ = tm.KillSession(nonGtSession)
 
-	// Create zombie sessions (tmux alive, but just shell - no Claude)
-	if err := tm.NewSession(gtSession, ""); err != nil {
-		t.Fatalf("NewSession(gt): %v", err)
+	// Create zombie sessions (tmux alive, but process is sleep - no Claude/node).
+	// Use NewSessionWithCommand with sleep to avoid loading .zshrc, which spawns
+	// a node process on this system. A node child of the zsh shell would cause
+	// IsAgentAlive to return true, preventing cleanup (gt-it10f6p).
+	if err := tm.NewSessionWithCommand(gtSession, "", "sleep 9999"); err != nil {
+		t.Fatalf("NewSessionWithCommand(gt): %v", err)
 	}
 	defer func() { _ = tm.KillSession(gtSession) }()
 
-	if err := tm.NewSession(hqSession, ""); err != nil {
-		t.Fatalf("NewSession(hq): %v", err)
+	if err := tm.NewSessionWithCommand(hqSession, "", "sleep 9999"); err != nil {
+		t.Fatalf("NewSessionWithCommand(hq): %v", err)
 	}
 	defer func() { _ = tm.KillSession(hqSession) }()
 
 	// Create a non-GT session (should NOT be cleaned up)
-	if err := tm.NewSession(nonGtSession, ""); err != nil {
-		t.Fatalf("NewSession(other): %v", err)
+	if err := tm.NewSessionWithCommand(nonGtSession, "", "sleep 9999"); err != nil {
+		t.Fatalf("NewSessionWithCommand(other): %v", err)
 	}
 	defer func() { _ = tm.KillSession(nonGtSession) }()
 
@@ -1306,14 +1308,13 @@ func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// Split and run node in the new pane (simulating an agent)
-	_, err := tm.run("split-window", "-t", sessionName, "-d",
-		"node", "-e", "setTimeout(() => {}, 30000)")
+	// Split and run sleep in the new pane (simulating an agent process)
+	_, err := tm.run("split-window", "-t", sessionName, "-d", "sleep", "10")
 	if err != nil {
 		t.Fatalf("split-window: %v", err)
 	}
 
-	// Give node a moment to start
+	// Give sleep a moment to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify we have 2 panes
@@ -1327,28 +1328,28 @@ func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
 		t.Skipf("Expected 2 panes, got %d — skipping multi-pane test", len(lines))
 	}
 
-	// FindAgentPane should find the node pane
+	// FindAgentPane should find the sleep pane
 	paneID, err := tm.FindAgentPane(sessionName)
 	if err != nil {
 		t.Fatalf("FindAgentPane: %v", err)
 	}
 
-	// Verify it found the correct pane (the one running node)
+	// Verify it found the correct pane (the one running sleep)
 	if paneID == "" {
-		t.Log("FindAgentPane returned empty — node may not have started yet or detection missed it")
-		// Not a hard failure since node startup timing varies
+		t.Log("FindAgentPane returned empty — sleep may not have started yet or detection missed it")
+		// Not a hard failure since process startup timing varies
 		return
 	}
 
-	// Verify the returned pane is actually running node
+	// Verify the returned pane is actually running sleep
 	cmdOut, err := tm.run("display-message", "-t", paneID, "-p", "#{pane_current_command}")
 	if err != nil {
 		t.Fatalf("display-message: %v", err)
 	}
 	paneCmd := strings.TrimSpace(cmdOut)
 	t.Logf("Agent pane %s running: %s", paneID, paneCmd)
-	if paneCmd != "node" {
-		t.Errorf("FindAgentPane returned pane running %q, want 'node'", paneCmd)
+	if paneCmd != "sleep" {
+		t.Errorf("FindAgentPane returned pane running %q, want 'sleep'", paneCmd)
 	}
 }
 
@@ -1702,6 +1703,32 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	}
 }
 
+// TestAdaptiveTextDelay verifies the delay scaling logic for post-text delivery.
+func TestAdaptiveTextDelay(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		msgLen  int
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{"empty", 0, 500 * time.Millisecond, 500 * time.Millisecond},
+		{"small single chunk", 100, 500 * time.Millisecond, 500 * time.Millisecond},
+		{"exactly one chunk", 512, 500 * time.Millisecond, 500 * time.Millisecond},
+		{"two chunks", 513, 525 * time.Millisecond, 525 * time.Millisecond},
+		{"five chunks", 2048 + 1, 600 * time.Millisecond, 600 * time.Millisecond},
+		{"huge message capped", 100000, 2 * time.Second, 2 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := adaptiveTextDelay(tt.msgLen)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("adaptiveTextDelay(%d) = %v, want [%v, %v]", tt.msgLen, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
 // TestMatchesPromptPrefix verifies that prompt matching handles non-breaking
 // spaces (NBSP, U+00A0) correctly. Claude Code uses NBSP after its > prompt
 // character, but the default ReadyPromptPrefix uses a regular space.
@@ -1781,6 +1808,29 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 	}
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Errorf("expected ErrIdleTimeout, got: %v", err)
+	}
+}
+
+func TestHasBusyIndicator(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"claude status busy", "⏵⏵ bypass permissions on ... · esc to interrupt", true},
+		{"codex status busy", "• Working (2m 18s • esc to interrupt)", true},
+		{"idle line", "› Review ready notification", false},
+		{"blank", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasBusyIndicator(tt.line); got != tt.want {
+				t.Errorf("hasBusyIndicator(%q) = %v, want %v", tt.line, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -2,7 +2,6 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -100,16 +99,18 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	}
 
 	// Polecat count cap (clown show #22): refuse to spawn if there are already
-	// too many active polecats. This is a last-resort safety net for the direct-dispatch
+	// too many working polecats. This is a last-resort safety net for the direct-dispatch
 	// path. For configurable capacity gating, use scheduler.max_polecats in town settings
 	// (see internal/scheduler/capacity/).
+	// Uses countWorkingPolecats to exclude idle polecats (completed work, no hook bead)
+	// that are available for re-sling under the persistent polecat model.
 	const defaultMaxActivePolecats = 25
-	activeCount := countActivePolecats()
-	if activeCount >= defaultMaxActivePolecats {
-		return nil, fmt.Errorf("polecat cap reached: %d active polecats (max %d). "+
+	workingCount := countWorkingPolecats()
+	if workingCount >= defaultMaxActivePolecats {
+		return nil, fmt.Errorf("polecat cap reached: %d working polecats (max %d). "+
 			"This is a safety limit to prevent spawn storms. "+
 			"Investigate why polecats are accumulating before spawning more",
-			activeCount, defaultMaxActivePolecats)
+			workingCount, defaultMaxActivePolecats)
 	}
 
 	// Per-bead respawn circuit breaker (clown show #22):
@@ -187,16 +188,12 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		}
 		reuseOK := false
 		if _, err := polecatMgr.ReuseIdlePolecat(polecatName, addOpts); err != nil {
-			if errors.Is(err, polecat.ErrSessionRunning) {
-				fmt.Printf("  Idle polecat %s still has a live session, allocating new...\n", polecatName)
+			// Branch-only reuse failed — try full worktree repair as fallback
+			fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v, trying full repair...\n", polecatName, err)
+			if _, err := polecatMgr.RepairWorktreeWithOptions(polecatName, true, addOpts); err != nil {
+				fmt.Printf("  Full repair also failed for %s: %v, allocating new...\n", polecatName, err)
 			} else {
-				// Branch-only reuse failed — try full worktree repair as fallback
-				fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v, trying full repair...\n", polecatName, err)
-				if _, err := polecatMgr.RepairWorktreeWithOptions(polecatName, true, addOpts); err != nil {
-					fmt.Printf("  Full repair also failed for %s: %v, allocating new...\n", polecatName, err)
-				} else {
-					reuseOK = true
-				}
+				reuseOK = true
 			}
 		} else {
 			reuseOK = true
@@ -362,13 +359,6 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	startOpts := polecat.SessionStartOptions{
 		RuntimeConfigDir: claudeConfigDir,
 		Agent:            s.agent,
-	}
-	if s.agent != "" {
-		cmd, err := config.BuildPolecatStartupCommandWithAgentOverride(s.RigName, s.PolecatName, r.Path, "", s.agent)
-		if err != nil {
-			return "", err
-		}
-		startOpts.Command = cmd
 	}
 	if err := polecatSessMgr.Start(s.PolecatName, startOpts); err != nil {
 		return "", fmt.Errorf("starting session: %w", err)

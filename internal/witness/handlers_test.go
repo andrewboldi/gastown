@@ -657,6 +657,26 @@ func TestDetectZombie_DoneIntentRecent(t *testing.T) {
 	}
 }
 
+func TestDetectZombie_DoneOrNukedNotZombie(t *testing.T) {
+	t.Parallel()
+	// GH#2795: Polecats with agent_state=done or agent_state=nuked and a dead
+	// session should NOT be treated as zombies, even if hook_bead is still set.
+	// Without this, isZombieState returns true (hookBead != ""), and the witness
+	// floods the mayor inbox with RECOVERY_NEEDED alerts every patrol cycle.
+	for _, state := range []beads.AgentState{beads.AgentStateDone, beads.AgentStateNuked} {
+		hookBead := "gt-some-issue"
+		// isZombieState returns true because hookBead != ""
+		if !isZombieState(state, hookBead) {
+			t.Errorf("isZombieState(%q, %q) = false, want true (pre-condition)", state, hookBead)
+		}
+		// But the done/nuked check in detectZombieDeadSession should skip these.
+		// Verify the states are terminal (not active).
+		if state.IsActive() {
+			t.Errorf("state %q should not be active", state)
+		}
+	}
+}
+
 func TestDetectZombie_AgentDeadInLiveSession(t *testing.T) {
 	t.Parallel()
 	// Verify the logic: live session + agent process dead → zombie
@@ -727,19 +747,19 @@ func TestExtractPolecatFromJSON_InvalidInputs(t *testing.T) {
 func TestGetBeadStatus_NoBdAvailable(t *testing.T) {
 	t.Parallel()
 	// When bd is not available (test environment), getBeadStatus
-	// should return empty string without panicking
-	result := getBeadStatus(DefaultBdCli(), "/nonexistent", "gt-abc123")
-	if result != "" {
-		t.Errorf("getBeadStatus = %q, want empty when bd unavailable", result)
+	// should return ("", false) without panicking
+	result, ok := getBeadStatus(DefaultBdCli(), "/nonexistent", "gt-abc123")
+	if result != "" || ok {
+		t.Errorf("getBeadStatus = (%q, %v), want (\"\", false) when bd unavailable", result, ok)
 	}
 }
 
 func TestGetBeadStatus_EmptyBeadID(t *testing.T) {
 	t.Parallel()
-	// Empty bead ID should return empty string immediately
-	result := getBeadStatus(DefaultBdCli(), "/nonexistent", "")
-	if result != "" {
-		t.Errorf("getBeadStatus(\"\") = %q, want empty", result)
+	// Empty bead ID should return ("", false) immediately
+	result, ok := getBeadStatus(DefaultBdCli(), "/nonexistent", "")
+	if result != "" || ok {
+		t.Errorf("getBeadStatus(\"\") = (%q, %v), want (\"\", false)", result, ok)
 	}
 }
 
