@@ -2182,8 +2182,11 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	// beads may still report the polecat as "working" because the bead state was
 	// never updated. Without this check, `gt polecat list` shows zombies as working.
 	// See: disk-space-resilience — all 5 polecats appeared "working" after sessions died.
+	//
+	// When tmux is nil (e.g., no tmux available or in tests), we cannot determine
+	// session state, so we must NOT assume the session is dead — default to alive.
 	sessionRunning, sessionStale := m.polecatSessionState(name)
-	sessionDead := !sessionRunning || sessionStale
+	sessionDead := m.tmux != nil && (!sessionRunning || sessionStale)
 
 	// Primary source: the work bead itself (status=hooked + assignee).
 	// This is the direct-tracking model introduced in hq-l6mm5.
