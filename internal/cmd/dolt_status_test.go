@@ -63,8 +63,13 @@ func TestReadBeadsRuntimeConfigDefaultServerAddr(t *testing.T) {
 	if cfg.Host != "127.0.0.1" {
 		t.Fatalf("Host = %q, want 127.0.0.1", cfg.Host)
 	}
-	if cfg.Port != doltserver.DefaultPort {
-		t.Fatalf("Port = %d, want default %d", cfg.Port, doltserver.DefaultPort)
+	// The no-port fallback resolves to DefaultConfig(townRoot).Port (dolt.go),
+	// which honors config.yaml / env overrides — so assert against that rather
+	// than the raw DefaultPort constant, which only holds when nothing overrides
+	// the port (true in unit runs, but not the integration env).
+	wantPort := doltserver.DefaultConfig(townRoot).Port
+	if cfg.Port != wantPort {
+		t.Fatalf("Port = %d, want default %d", cfg.Port, wantPort)
 	}
 }
 
